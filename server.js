@@ -6,9 +6,10 @@
 // Open the server address in a browser to check if its up.
 
 const http = require("http");
+const crypto = require("crypto");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 2;
+const PROTOCOL = 3;
 const SESSION_TIMEOUT_MS = 20000; // no poll for this long = player is gone
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
@@ -16,6 +17,118 @@ const sessions = new Map(); // sid -> client
 let queue = []; // sids waiting for a match
 const rooms = new Map(); // roomId -> { a, b, song }
 let shuttingDown = false;
+
+// ------------------------------------------------------------ accounts
+// Saved in Upstash Redis when UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN are set (Render > Environment).
+// Without them accounts live in memory and get wiped when the server restarts.
+const DB_URL = (process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/+$/, "");
+const DB_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const memoryAccounts = new Map();
+if (!DB_URL || !DB_TOKEN) console.log("WARNING: no database set, accounts will be lost on restart");
+
+async function db(command) {
+  const r = await fetch(DB_URL, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + DB_TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify(command),
+  });
+  const j = await r.json();
+  if (j.error) throw new Error(j.error);
+  return j.result;
+}
+
+async function getAccount(key) {
+  if (!DB_URL || !DB_TOKEN) return memoryAccounts.get(key) || null;
+  const v = await db(["GET", "acct:" + key]);
+  return v ? JSON.parse(v) : null;
+}
+
+async function createAccount(key, acct) {
+  if (!DB_URL || !DB_TOKEN) {
+    if (memoryAccounts.has(key)) return false;
+    memoryAccounts.set(key, acct);
+    return true;
+  }
+  // NX = only if nobody took the name a millisecond ago
+  return (await db(["SET", "acct:" + key, JSON.stringify(acct), "NX"])) === "OK";
+}
+
+function hashPassword(password, salt) {
+  return crypto.scryptSync(password, salt, 32).toString("hex");
+}
+function sha(text) {
+  return crypto.createHash("sha256").update(text).digest("hex");
+}
+function sameHex(a, b) {
+  const x = Buffer.from(String(a), "hex");
+  const y = Buffer.from(String(b), "hex");
+  return x.length === y.length && x.length > 0 && crypto.timingSafeEqual(x, y);
+}
+
+function validName(n) {
+  return typeof n === "string" && n.length >= 3 && n.length <= 16 && /^[\x21-\x7E]+$/.test(n);
+}
+function validPassword(p) {
+  return typeof p === "string" && p.length >= 6 && p.length <= 64 && /^[\x21-\x7E]+$/.test(p);
+}
+
+// slow down password guessing: per ip and per account
+const attempts = new Map(); // key -> {count, until}
+function tooMany(key, max, windowMs) {
+  const now = Date.now();
+  let a = attempts.get(key);
+  if (!a || a.until < now) a = { count: 0, until: now + windowMs };
+  a.count++;
+  attempts.set(key, a);
+  return a.count > max;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, a] of attempts) if (a.until < now) attempts.delete(k);
+}, 60000);
+
+async function onAuth(body, ip) {
+  if (shuttingDown) return { ok: false, error: "Server Is Down. Be Back Soon!" };
+  if (body.protocol !== PROTOCOL) return { ok: false, error: "outdated mod, download the new version" };
+  const name = body.name;
+  const password = body.password;
+  if (!validName(name)) return { ok: false, error: "name must be 3-16 characters, no spaces" };
+  if (!validPassword(password)) return { ok: false, error: "password must be 6-64 characters, no spaces" };
+  if (tooMany("ip:" + ip, 20, 60000)) return { ok: false, error: "too many tries, wait a minute" };
+
+  const key = name.toLowerCase();
+  let acct = await getAccount(key);
+  if (!acct) {
+    // new name = make the account
+    const salt = crypto.randomBytes(16).toString("hex");
+    const token = crypto.randomBytes(32).toString("hex");
+    acct = { name, salt, hash: hashPassword(password, salt), tokenHash: sha(token), created: Date.now() };
+    if (!(await createAccount(key, acct))) return { ok: false, error: "that name just got taken, try again" };
+    console.log(`new account: ${name}`);
+    return { ok: true, created: true, name, token };
+  }
+
+  if (tooMany("acct:" + key, 8, 5 * 60000)) return { ok: false, error: "too many wrong passwords, wait 5 minutes" };
+  if (!sameHex(hashPassword(password, acct.salt), acct.hash)) return { ok: false, error: "wrong password (or that name is taken)" };
+  attempts.delete("acct:" + key);
+  // the same token works on all ur devices, so pc and phone can both stay logged in
+  const token = crypto.randomBytes(32).toString("hex");
+  if (!acct.tokens) acct.tokens = [acct.tokenHash];
+  acct.tokens = [sha(token), ...acct.tokens].slice(0, 5); // remember the last 5 devices
+  acct.tokenHash = acct.tokens[0];
+  if (DB_URL && DB_TOKEN) await db(["SET", "acct:" + key, JSON.stringify(acct)]);
+  else memoryAccounts.set(key, acct);
+  return { ok: true, created: false, name: acct.name, token };
+}
+
+async function checkToken(name, token) {
+  if (!validName(name) || typeof token !== "string" || token.length < 10) return null;
+  const acct = await getAccount(name.toLowerCase());
+  if (!acct) return null;
+  const list = acct.tokens || [acct.tokenHash];
+  const h = sha(token);
+  return list.some((t) => sameHex(t, h)) ? acct.name : null;
+}
 
 function newId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -108,7 +221,7 @@ function removeSession(c) {
   broadcastQueueCount();
 }
 
-function onPoll(body) {
+async function onPoll(body) {
   if (shuttingDown) return { msgs: [{ t: "server_down" }] };
 
   const out = Array.isArray(body.out) ? body.out.slice(0, 50) : [];
@@ -119,7 +232,11 @@ function onPoll(body) {
     const hello = out.find((m) => m && m.t === "hello");
     if (!hello) return { error: "bad_session", msgs: [{ t: "error", msg: "session expired" }] };
     if (hello.protocol !== PROTOCOL) return { msgs: [{ t: "error", msg: "outdated mod, download the new version" }] };
-    c = { sid: newId(), name: cleanName(hello.name), room: null, inbox: [], lastSeen: Date.now() };
+    const realName = await checkToken(hello.name, hello.token);
+    if (!realName) return { msgs: [{ t: "error", code: "auth", msg: "log in again" }] };
+    // same account logging in twice: kick the old one
+    for (const old of [...sessions.values()]) if (old.name.toLowerCase() === realName.toLowerCase()) removeSession(old);
+    c = { sid: newId(), name: realName, room: null, inbox: [], lastSeen: Date.now() };
     sessions.set(c.sid, c);
     send(c, { t: "welcome", name: c.name, online: sessions.size });
   }
@@ -132,20 +249,29 @@ function onPoll(body) {
 }
 
 const server = http.createServer((req, res) => {
-  if (req.method === "POST" && req.url.startsWith("/poll")) {
+  const isPoll = req.url.startsWith("/poll");
+  const isAuth = req.url.startsWith("/auth");
+  if (req.method === "POST" && (isPoll || isAuth)) {
     let data = "";
     req.on("data", (chunk) => {
       data += chunk;
       if (data.length > 65536) req.destroy(); // junk protection
     });
-    req.on("end", () => {
+    req.on("end", async () => {
       let body = {};
       try {
         body = JSON.parse(data || "{}");
       } catch {
         body = {};
       }
-      const result = onPoll(body);
+      const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
+      let result;
+      try {
+        result = isAuth ? await onAuth(body, ip) : await onPoll(body);
+      } catch (e) {
+        console.log("error:", e.message);
+        result = isAuth ? { ok: false, error: "server error, try again" } : { msgs: [] };
+      }
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
       res.end(JSON.stringify(result));
     });
@@ -154,7 +280,7 @@ const server = http.createServer((req, res) => {
 
   // anything else: simple status page, handy to check in a browser
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end(`FNF Online server is running. players online: ${sessions.size}, in queue: ${queue.length}, matches: ${rooms.size}\n`);
+  res.end(`FNF Online server is running. players online: ${sessions.size}, in queue: ${queue.length}, matches: ${rooms.size}, accounts saved: ${DB_URL && DB_TOKEN ? "yes" : "NO (database not set)"}\n`);
 });
 
 // players who stopped polling (closed the game, lost wifi) get removed
