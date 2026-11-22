@@ -1,0 +1,12 @@
+{
+  "name": "fnf-online-server",
+  "version": "0.1.0",
+  "description": "Matchmaking and relay server for the FNF Online V-Slice mod",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
