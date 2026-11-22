@@ -9,7 +9,7 @@ const http = require("http");
 const crypto = require("crypto");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 3;
+const PROTOCOL = 4;
 const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
@@ -51,6 +51,36 @@ async function createAccount(key, acct) {
   }
   // NX = only if nobody took the name a millisecond ago
   return (await db(["SET", "acct:" + key, JSON.stringify(acct), "NX"])) === "OK";
+}
+
+// ------------------------------------------------------------ owner + bans
+// accounts in OWNERS (Render > Environment, comma separated) can use owner tools. default: Owner
+const OWNERS = (process.env.OWNERS || "Owner").split(",").map((n) => n.trim().toLowerCase()).filter(Boolean);
+const memoryBans = new Set();
+
+function isOwnerName(name) {
+  return OWNERS.includes(String(name || "").toLowerCase());
+}
+
+async function isBanned(name) {
+  const key = String(name || "").toLowerCase();
+  if (!DB_URL || !DB_TOKEN) return memoryBans.has(key);
+  return (await db(["SISMEMBER", "bans", key])) === 1;
+}
+
+async function setBanned(name, banned) {
+  const key = String(name || "").toLowerCase();
+  if (!DB_URL || !DB_TOKEN) {
+    if (banned) memoryBans.add(key);
+    else memoryBans.delete(key);
+    return;
+  }
+  await db([banned ? "SADD" : "SREM", "bans", key]);
+}
+
+async function listBans() {
+  if (!DB_URL || !DB_TOKEN) return [...memoryBans];
+  return (await db(["SMEMBERS", "bans"])) || [];
 }
 
 function hashPassword(password, salt) {
@@ -109,6 +139,7 @@ async function onAuth(body, ip) {
   }
 
   if (tooMany("acct:" + key, 8, 5 * 60000)) return { ok: false, error: "too many wrong passwords, wait 5 minutes" };
+  if (await isBanned(key)) return { ok: false, error: "this account is banned" };
   if (!sameHex(hashPassword(password, acct.salt), acct.hash)) return { ok: false, error: "wrong password (or that name is taken)" };
   attempts.delete("acct:" + key);
   // the same token works on all ur devices, so pc and phone can both stay logged in
@@ -163,21 +194,52 @@ function broadcastQueueCount() {
   for (const id of queue) send(sessions.get(id), { t: "queued", count: queue.length });
 }
 
+function makeMatch(a, b, isPrivate) {
+  const roomId = "r" + newId();
+  const song = SONGS[Math.floor(Math.random() * SONGS.length)];
+  rooms.set(roomId, { a: a.sid, b: b.sid, song });
+  a.room = b.room = roomId;
+  // a plays as bf (picks the song), b as dad
+  send(a, { t: "match", room: roomId, song, side: "bf", opponent: b.name, private: !!isPrivate });
+  send(b, { t: "match", room: roomId, song, side: "dad", opponent: a.name, private: !!isPrivate });
+  console.log(`match${isPrivate ? " (private)" : ""}: ${a.name} vs ${b.name}`);
+}
+
 function tryMatch() {
   while (queue.length >= 2) {
     const a = sessions.get(queue.shift());
     const b = sessions.get(queue.shift());
     if (!a || !b) continue;
-    const roomId = "r" + newId();
-    const song = SONGS[Math.floor(Math.random() * SONGS.length)];
-    rooms.set(roomId, { a: a.sid, b: b.sid, song });
-    a.room = b.room = roomId;
-    // a plays as bf, b as dad
-    send(a, { t: "match", room: roomId, song, side: "bf", opponent: b.name });
-    send(b, { t: "match", room: roomId, song, side: "dad", opponent: a.name });
-    console.log(`match: ${a.name} vs ${b.name} on ${song}`);
+    makeMatch(a, b, false);
   }
   broadcastQueueCount();
+}
+
+// private rooms: code -> host sid
+const privateRooms = new Map();
+const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O or 1/I mixups
+
+function closeHostedRoom(c) {
+  if (c.hostCode) {
+    privateRooms.delete(c.hostCode);
+    c.hostCode = null;
+  }
+}
+
+function newRoomCode() {
+  for (let tries = 0; tries < 50; tries++) {
+    let code = "";
+    for (let i = 0; i < 5; i++) code += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
+    if (!privateRooms.has(code)) return code;
+  }
+  return null;
+}
+
+function kickSession(target, msg) {
+  leaveQueue(target);
+  leaveRoom(target);
+  closeHostedRoom(target);
+  target.kickMsg = msg; // told on their next poll, then removed
 }
 
 function cleanName(n) {
@@ -186,18 +248,70 @@ function cleanName(n) {
   return n.length >= 3 ? n : "guest" + Math.floor(Math.random() * 9999);
 }
 
-function handle(c, msg) {
+async function handle(c, msg) {
   if (!msg || typeof msg !== "object") return;
   switch (msg.t) {
     case "queue":
       leaveRoom(c);
+      closeHostedRoom(c);
       if (!queue.includes(c.sid)) queue.push(c.sid);
       tryMatch();
       break;
     case "cancel":
       leaveQueue(c);
+      closeHostedRoom(c);
       broadcastQueueCount();
       break;
+    case "create_room": {
+      leaveQueue(c);
+      leaveRoom(c);
+      closeHostedRoom(c);
+      const code = newRoomCode();
+      if (!code) return send(c, { t: "error", code: "room", msg: "couldnt make a room, try again" });
+      privateRooms.set(code, c.sid);
+      c.hostCode = code;
+      send(c, { t: "room_created", code });
+      break;
+    }
+    case "join_room": {
+      const code = String(msg.code || "").toUpperCase().trim();
+      const host = sessions.get(privateRooms.get(code));
+      if (!host || host === c || host.kickMsg) return send(c, { t: "error", code: "room", msg: "room not found, check the code" });
+      leaveQueue(c);
+      leaveRoom(c);
+      closeHostedRoom(c);
+      closeHostedRoom(host);
+      makeMatch(host, c, true);
+      break;
+    }
+    // ---------- owner tools (server checks the account, the mod alone cant do anything)
+    case "admin_list": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const players = [...sessions.values()]
+        .filter((s) => !s.kickMsg)
+        .map((s) => ({ name: s.name, status: s.room ? "in a match" : queue.includes(s.sid) ? "searching" : s.hostCode ? "private room" : "menu" }));
+      send(c, { t: "admin_list", players, banned: await listBans() });
+      break;
+    }
+    case "admin_kick":
+    case "admin_ban":
+    case "admin_unban": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const name = String(msg.name || "");
+      if (!name || isOwnerName(name)) return send(c, { t: "admin_done", msg: "cant do that to an owner" });
+      if (msg.t === "admin_unban") {
+        await setBanned(name, false);
+        console.log(`owner ${c.name} unbanned ${name}`);
+        return send(c, { t: "admin_done", msg: name + " unbanned" });
+      }
+      if (msg.t === "admin_ban") await setBanned(name, true);
+      for (const s of sessions.values()) {
+        if (s.name.toLowerCase() === name.toLowerCase()) kickSession(s, msg.t === "admin_ban" ? "u got banned by the owner" : "u got kicked by the owner");
+      }
+      console.log(`owner ${c.name} ${msg.t === "admin_ban" ? "banned" : "kicked"} ${name}`);
+      send(c, { t: "admin_done", msg: name + (msg.t === "admin_ban" ? " banned" : " kicked") });
+      break;
+    }
     case "leave":
       leaveRoom(c);
       break;
@@ -217,6 +331,7 @@ function removeSession(c) {
   if (!sessions.has(c.sid)) return;
   leaveQueue(c);
   leaveRoom(c);
+  closeHostedRoom(c);
   sessions.delete(c.sid);
   broadcastQueueCount();
 }
@@ -234,15 +349,22 @@ async function onPoll(body) {
     if (hello.protocol !== PROTOCOL) return { msgs: [{ t: "error", msg: "outdated mod, download the new version" }] };
     const realName = await checkToken(hello.name, hello.token);
     if (!realName) return { msgs: [{ t: "error", code: "auth", msg: "log in again" }] };
+    if (await isBanned(realName)) return { msgs: [{ t: "error", code: "banned", msg: "this account is banned" }] };
     // same account logging in twice: kick the old one
     for (const old of [...sessions.values()]) if (old.name.toLowerCase() === realName.toLowerCase()) removeSession(old);
     c = { sid: newId(), name: realName, room: null, inbox: [], lastSeen: Date.now() };
     sessions.set(c.sid, c);
-    send(c, { t: "welcome", name: c.name, online: sessions.size });
+    send(c, { t: "welcome", name: c.name, online: sessions.size, owner: isOwnerName(c.name) });
   }
 
   c.lastSeen = Date.now();
-  for (const m of out) if (m && m.t !== "hello") handle(c, m);
+  if (c.kickMsg) {
+    // kicked/banned: tell them once, then they're gone
+    const msg = c.kickMsg;
+    sessions.delete(c.sid);
+    return { msgs: [{ t: "kicked", msg }] };
+  }
+  for (const m of out) if (m && m.t !== "hello") await handle(c, m);
   if (!sessions.has(c.sid)) return { msgs: [] }; // said bye
 
   return { sid: c.sid, msgs: c.inbox.splice(0) };
