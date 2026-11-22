@@ -10,7 +10,7 @@ const crypto = require("crypto");
 
 const PORT = Number(process.env.PORT || 7777);
 const PROTOCOL = 3;
-const SESSION_TIMEOUT_MS = 20000; // no poll for this long = player is gone
+const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
 const sessions = new Map(); // sid -> client
