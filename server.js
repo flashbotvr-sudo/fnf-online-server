@@ -15,7 +15,7 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 8;
+const PROTOCOL = 9;
 const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
@@ -457,10 +457,16 @@ async function prepareMod(id, url) {
     const root = findModRoot(out);
     if (!root) throw new Error("thats not a V-Slice mod (no _polymod_meta.json inside)");
 
-    // 4) repack as a plain zip the game can read
+    // 4) repack as a plain zip the game can read, inside one folder named after the mod
+    //    (phones install it with a Shortcut that just unzips into the mods folder)
     job.state = "packing";
     const zip = path.join(work, "mod.zip");
-    await run7z(["a", "-tzip", "-mx=1", "-bso0", "-bsp0", zip, "."], root);
+    const folder = String(job.name || "mod").replace(/[^A-Za-z0-9 ._-]/g, "_").slice(0, 60) || "mod";
+    const packDir = path.join(work, "pack");
+    fs.mkdirSync(packDir, { recursive: true });
+    fs.renameSync(root, path.join(packDir, folder));
+    await run7z(["a", "-tzip", "-mx=1", "-bso0", "-bsp0", zip, folder], packDir);
+    fs.rmSync(packDir, { recursive: true, force: true });
     fs.rmSync(out, { recursive: true, force: true });
 
     job.file = zip;
@@ -525,14 +531,14 @@ function onModChunk(body) {
   return { ok: true, next: job.next, state: job.state };
 }
 
-function startModJob(url) {
-  const id = crypto.createHash("sha1").update(url).digest("hex").slice(0, 16);
+function startModJob(url, name) {
+  const id = crypto.createHash("sha1").update(url + "|" + (name || "")).digest("hex").slice(0, 16);
   const existing = modJobs.get(id);
   if (existing && existing.state !== "error") {
     existing.touched = Date.now();
     return id;
   }
-  modJobs.set(id, { state: "queued", pct: 0, msg: "", file: null, size: 0, touched: Date.now() });
+  modJobs.set(id, { state: "queued", pct: 0, msg: "", file: null, size: 0, touched: Date.now(), name: name || "mod" });
   prepareMod(id, url);
   return id;
 }
@@ -1053,7 +1059,7 @@ const server = http.createServer((req, res) => {
       } catch {}
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
       if (!allowedModUrl(body.url)) return res.end(JSON.stringify({ ok: false, error: "only GameBanana downloads are allowed" }));
-      res.end(JSON.stringify({ ok: true, job: startModJob(body.url) }));
+      res.end(JSON.stringify({ ok: true, job: startModJob(body.url, typeof body.name === "string" ? body.name : "") }));
     });
     return;
   }
@@ -1073,7 +1079,7 @@ const server = http.createServer((req, res) => {
       return res.end("not ready");
     }
     j.touched = Date.now();
-    res.writeHead(200, { "Content-Type": "application/zip", "Content-Length": j.size });
+    res.writeHead(200, { "Content-Type": "application/zip", "Content-Length": j.size, "Content-Disposition": 'attachment; filename="mod.zip"' });
     fs.createReadStream(j.file).pipe(res);
     return;
   }
