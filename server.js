@@ -15,7 +15,7 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 6;
+const PROTOCOL = 7;
 const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
