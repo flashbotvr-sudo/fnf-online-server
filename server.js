@@ -1704,7 +1704,7 @@ async function onPoll(body) {
   for (const m of out) if (m && m.t !== "hello") await handle(c, m);
   if (!sessions.has(c.sid)) return { msgs: [] }; // said bye
 
-  return { sid: c.sid, msgs: c.inbox.splice(0) };
+  return { sid: c.sid, msgs: c.inbox.splice(0), now: Date.now() };
 }
 
 const server = http.createServer((req, res) => {
