@@ -15,7 +15,7 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 4;
+const PROTOCOL = 5;
 const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
@@ -156,7 +156,7 @@ setInterval(() => {
 
 async function onAuth(body, ip) {
   if (shuttingDown) return { ok: false, error: "Server Is Down. Be Back Soon!" };
-  if (body.protocol !== PROTOCOL) return { ok: false, error: "outdated mod, download the new version" };
+  if (body.protocol !== PROTOCOL) return { ok: false, error: "ur mod is outdated! get the new version from GameBanana" };
   const name = body.name;
   const password = body.password;
   if (!validName(name)) return { ok: false, error: "name must be 3-16 characters, no spaces" };
@@ -586,7 +586,7 @@ async function onPoll(body) {
     // new player, first message has to be hello
     const hello = out.find((m) => m && m.t === "hello");
     if (!hello) return { error: "bad_session", msgs: [{ t: "error", msg: "session expired" }] };
-    if (hello.protocol !== PROTOCOL) return { msgs: [{ t: "error", msg: "outdated mod, download the new version" }] };
+    if (hello.protocol !== PROTOCOL) return { msgs: [{ t: "error", msg: "ur mod is outdated! get the new version from GameBanana" }] };
     const realName = await checkToken(hello.name, hello.token);
     if (!realName) return { msgs: [{ t: "error", code: "auth", msg: "log in again" }] };
     if (await isBanned(realName)) return { msgs: [{ t: "error", code: "banned", msg: "this account is banned" }] };
