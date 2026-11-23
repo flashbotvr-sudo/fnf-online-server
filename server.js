@@ -15,7 +15,7 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 12;
+const PROTOCOL = 16;
 const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
@@ -57,6 +57,23 @@ async function createAccount(key, acct) {
   }
   // NX = only if nobody took the name a millisecond ago
   return (await db(["SET", "acct:" + key, JSON.stringify(acct), "NX"])) === "OK";
+}
+
+// removes an account + its rank, friends, requests, badge (used by delete + rename)
+async function deleteAccount(key) {
+  for (const f of await getFriends(key)) await setFriend(f, key, false);
+  allAccounts.delete(key);
+  statsCache.delete(key);
+  delete badgeCache[key];
+  if (!DB_URL || !DB_TOKEN) {
+    memoryAccounts.delete(key);
+    memoryStats.delete(key);
+    memoryFriends.delete(key);
+    return;
+  }
+  for (const k of ["acct:", "stats:", "friends:", "freq:", "unread:"]) await db(["DEL", k + key]).catch(() => {});
+  await db(["ZREM", "lb", key]).catch(() => {});
+  await db(["HDEL", "badges", key]).catch(() => {});
 }
 
 // every account name (lowercase -> how they typed it), kept in memory so the owner list is free
@@ -101,8 +118,147 @@ function isOwnerName(name) {
 
 async function isBanned(name) {
   const key = String(name || "").toLowerCase();
-  if (!DB_URL || !DB_TOKEN) return memoryBans.has(key);
-  return (await db(["SISMEMBER", "bans", key])) === 1;
+  const on = !DB_URL || !DB_TOKEN ? memoryBans.has(key) : (await db(["SISMEMBER", "bans", key])) === 1;
+  if (!on) return false;
+  // temp bans run out by themselves
+  const info = await getKV("baninfo", key);
+  if (info && info.until && Date.now() > info.until) {
+    await setBanned(key, false);
+    return false;
+  }
+  return true;
+}
+
+// small json values in a hash ("baninfo", "mutes", "badges")
+const memoryKV = new Map();
+async function getKV(hash, key) {
+  if (!DB_URL || !DB_TOKEN) {
+    const m = memoryKV.get(hash);
+    return m && m.has(key) ? m.get(key) : null;
+  }
+  try {
+    const v = await db(["HGET", hash, key]);
+    return v ? JSON.parse(v) : null;
+  } catch {
+    return null;
+  }
+}
+async function setKV(hash, key, value) {
+  if (!DB_URL || !DB_TOKEN) {
+    if (!memoryKV.has(hash)) memoryKV.set(hash, new Map());
+    if (value === null) memoryKV.get(hash).delete(key);
+    else memoryKV.get(hash).set(key, value);
+    return;
+  }
+  if (value === null) await db(["HDEL", hash, key]);
+  else await db(["HSET", hash, key, JSON.stringify(value)]);
+}
+async function getAllKV(hash) {
+  const out = {};
+  if (!DB_URL || !DB_TOKEN) {
+    for (const [k, v] of memoryKV.get(hash) || []) out[k] = v;
+    return out;
+  }
+  try {
+    const r = (await db(["HGETALL", hash])) || [];
+    for (let i = 0; i + 1 < r.length; i += 2) {
+      try {
+        out[r[i]] = JSON.parse(r[i + 1]);
+      } catch {}
+    }
+  } catch {}
+  return out;
+}
+
+function timeLeft(until) {
+  if (!until) return "forever";
+  const mins = Math.max(1, Math.round((until - Date.now()) / 60000));
+  if (mins < 60) return mins + " min";
+  if (mins < 2880) {
+    const h = Math.round(mins / 60);
+    return h + (h === 1 ? " hour" : " hours");
+  }
+  const d = Math.round(mins / 1440);
+  return d + (d === 1 ? " day" : " days");
+}
+
+async function banMessage(key) {
+  const info = await getKV("baninfo", key);
+  let m = "this account is banned";
+  if (info) {
+    m += info.until ? " for " + timeLeft(info.until) : " forever";
+    if (info.reason) m += ": " + info.reason;
+  }
+  return m;
+}
+
+// badges like VIP / TESTER (cached in memory, theres not many)
+let badgeCache = {};
+function badgeOf(name) {
+  return badgeCache[String(name).toLowerCase()] || null;
+}
+
+// server settings the owner changes in game (maintenance, news popup, blocked mods)
+let serverConfig = { maintenance: false, news: null, blockedMods: [] };
+async function loadConfig() {
+  try {
+    if (DB_URL && DB_TOKEN) {
+      const v = await db(["GET", "config"]);
+      if (v) serverConfig = Object.assign(serverConfig, JSON.parse(v));
+    }
+    badgeCache = await getAllKV("badges");
+  } catch (e) {
+    console.log("config load failed:", e.message);
+  }
+}
+async function saveConfig() {
+  if (DB_URL && DB_TOKEN) await db(["SET", "config", JSON.stringify(serverConfig)]).catch(() => {});
+}
+function simpleKey(t) {
+  return String(t || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// reports from players
+const memoryReports = [];
+async function addReport(r) {
+  if (!DB_URL || !DB_TOKEN) {
+    memoryReports.push(r);
+    while (memoryReports.length > 100) memoryReports.shift();
+    return;
+  }
+  await db(["RPUSH", "reports", JSON.stringify(r)]);
+  await db(["LTRIM", "reports", "-100", "-1"]);
+}
+async function getReports() {
+  if (!DB_URL || !DB_TOKEN) return memoryReports.slice();
+  try {
+    return ((await db(["LRANGE", "reports", "0", "-1"])) || []).map((x) => {
+      try {
+        return JSON.parse(x);
+      } catch {
+        return null;
+      }
+    }).filter((x) => x);
+  } catch {
+    return [];
+  }
+}
+async function setReports(list) {
+  if (!DB_URL || !DB_TOKEN) {
+    memoryReports.length = 0;
+    memoryReports.push(...list);
+    return;
+  }
+  await db(["DEL", "reports"]);
+  for (const r of list) await db(["RPUSH", "reports", JSON.stringify(r)]);
+}
+
+// todays numbers for the owner stats page (reset every day, UTC)
+let today = { day: new Date().toISOString().slice(0, 10), peak: 0, matches: 0, newAccounts: 0, songs: {} };
+function todayStats() {
+  const d = new Date().toISOString().slice(0, 10);
+  if (today.day !== d) today = { day: d, peak: 0, matches: 0, newAccounts: 0, songs: {} };
+  return today;
 }
 
 async function setBanned(name, banned) {
@@ -185,6 +341,7 @@ function publicStats(name, st) {
     streak: st.streak,
     best: st.best,
     owner: isOwnerName(name),
+    badge: badgeOf(name),
   };
 }
 
@@ -271,16 +428,55 @@ function statusOf(s) {
   return "online";
 }
 
+// ---------- friend requests: "freq:<name>" = who asked to be their friend
+const memoryRequests = new Map();
+
+async function getRequests(name) {
+  const key = String(name).toLowerCase();
+  if (!DB_URL || !DB_TOKEN) return [...(memoryRequests.get(key) || [])];
+  try {
+    return (await db(["SMEMBERS", "freq:" + key])) || [];
+  } catch {
+    return [];
+  }
+}
+
+async function setRequest(to, from, add) {
+  const t = String(to).toLowerCase();
+  const f = String(from).toLowerCase();
+  if (!DB_URL || !DB_TOKEN) {
+    if (!memoryRequests.has(t)) memoryRequests.set(t, new Set());
+    if (add) memoryRequests.get(t).add(f);
+    else memoryRequests.get(t).delete(f);
+    return;
+  }
+  await db([add ? "SADD" : "SREM", "freq:" + t, f]);
+}
+
+async function sendRequests(c) {
+  const list = [];
+  for (const k of await getRequests(c.name)) list.push({ name: displayName(k), status: statusOf(findSessionByName(k)), owner: isOwnerName(k) });
+  list.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+  send(c, { t: "friend_requests", list });
+}
+
+async function makeFriends(a, b) {
+  await setFriend(a, b, true);
+  await setFriend(b, a, true);
+  await setRequest(a, b, false);
+  await setRequest(b, a, false);
+}
+
 async function sendFriends(c) {
   const list = [];
   const unread = await getUnread(c.name);
   for (const k of await getFriends(c.name)) {
     const s = findSessionByName(k);
-    list.push({ name: displayName(k), status: statusOf(s), owner: isOwnerName(k), unread: unread[k] || 0 });
+    list.push({ name: displayName(k), status: statusOf(s), owner: isOwnerName(k), badge: badgeOf(k), unread: unread[k] || 0 });
   }
   // online first, then by name
   list.sort((a, b) => (a.status === "offline") - (b.status === "offline") || a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
-  send(c, { t: "friends", list });
+  send(c, { t: "friends", list, requests: (await getRequests(c.name)).length });
 }
 
 // ---------- friend chat (last 50 messages per pair, unread counts)
@@ -410,12 +606,13 @@ async function onAuth(body, ip) {
     acct = { name, salt, hash: hashPassword(password, salt), tokenHash: sha(token), created: Date.now() };
     if (!(await createAccount(key, acct))) return { ok: false, error: "that name just got taken, try again" };
     allAccounts.set(key, name);
+    todayStats().newAccounts++;
     console.log(`new account: ${name}`);
     return { ok: true, created: true, name, token };
   }
 
   if (tooMany("acct:" + key, 8, 5 * 60000)) return { ok: false, error: "too many wrong passwords, wait 5 minutes" };
-  if (await isBanned(key)) return { ok: false, error: "this account is banned" };
+  if (await isBanned(key)) return { ok: false, error: await banMessage(key) };
   if (!sameHex(hashPassword(password, acct.salt), acct.hash)) return { ok: false, error: "wrong password (or that name is taken)" };
   attempts.delete("acct:" + key);
   // the same token works on all ur devices, so pc and phone can both stay logged in
@@ -774,6 +971,7 @@ function makeMatch(a, b, isPrivate, opts) {
   a.room = b.room = roomId;
   a.spectating = b.spectating = null;
   console.log(`match${isPrivate ? " (private)" : ""}: ${a.name} vs ${b.name}`);
+  todayStats().matches++;
   // send it after looking up their profiles
   Promise.all([getStats(a.name), getStats(b.name)])
     .catch(() => [newStats(), newStats()])
@@ -871,6 +1069,7 @@ async function handle(c, msg) {
   if (!msg || typeof msg !== "object") return;
   switch (msg.t) {
     case "queue":
+      if (serverConfig.maintenance && !isOwnerName(c.name)) return send(c, { t: "error", code: "maint", msg: "Server under maintenance, be back soon!" });
       leaveRoom(c);
       closeHostedRoom(c);
       c.queueMode = msg.mode === "normal" ? "normal" : "bo3";
@@ -885,6 +1084,7 @@ async function handle(c, msg) {
       broadcastQueueCount();
       break;
     case "create_room": {
+      if (serverConfig.maintenance && !isOwnerName(c.name)) return send(c, { t: "error", code: "room", msg: "Server under maintenance, be back soon!" });
       leaveQueue(c);
       leaveRoom(c);
       // reconnecting host asks for the same code back
@@ -906,6 +1106,7 @@ async function handle(c, msg) {
       break;
     }
     case "join_room": {
+      if (serverConfig.maintenance && !isOwnerName(c.name)) return send(c, { t: "error", code: "room", msg: "Server under maintenance, be back soon!" });
       const code = String(msg.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
       const entry = privateRooms.get(code);
       if (!entry) {
@@ -943,24 +1144,331 @@ async function handle(c, msg) {
       if (!name || isOwnerName(name)) return send(c, { t: "admin_done", msg: "cant do that to an owner" });
       if (msg.t === "admin_unban") {
         await setBanned(name, false);
+        await setKV("baninfo", name.toLowerCase(), null);
         console.log(`owner ${c.name} unbanned ${name}`);
         return send(c, { t: "admin_done", msg: name + " unbanned" });
       }
-      if (msg.t === "admin_ban") await setBanned(name, true);
+      let banText = "u got banned by the owner";
+      if (msg.t === "admin_ban") {
+        await setBanned(name, true);
+        const mins = Math.max(0, Number(msg.mins) || 0);
+        const reason = String(msg.reason || "").slice(0, 80);
+        await setKV("baninfo", name.toLowerCase(), { until: mins ? Date.now() + mins * 60000 : 0, reason });
+        banText = "u got banned " + (mins ? "for " + timeLeft(Date.now() + mins * 60000) : "forever") + (reason ? ": " + reason : "");
+      }
       for (const s of sessions.values()) {
-        if (s.name.toLowerCase() === name.toLowerCase()) kickSession(s, msg.t === "admin_ban" ? "u got banned by the owner" : "u got kicked by the owner");
+        if (s.name.toLowerCase() === name.toLowerCase()) kickSession(s, msg.t === "admin_ban" ? banText : "u got kicked by the owner");
       }
       console.log(`owner ${c.name} ${msg.t === "admin_ban" ? "banned" : "kicked"} ${name}`);
       send(c, { t: "admin_done", msg: name + (msg.t === "admin_ban" ? " banned" : " kicked") });
+      break;
+    }
+    // ---------- players change their own password (needs the old one)
+    case "change_pass": {
+      c.passTries = (c.passTries || 0) + 1;
+      if (c.passTries > 5) return send(c, { t: "pass_result", ok: false, msg: "too many tries, wait a bit and log in again" });
+      const key = c.name.toLowerCase();
+      const acct = await getAccount(key);
+      if (!acct) return send(c, { t: "pass_result", ok: false, msg: "account not found" });
+      if (!sameHex(hashPassword(String(msg.old || ""), acct.salt), acct.hash)) return send(c, { t: "pass_result", ok: false, msg: "ur old password is wrong" });
+      if (!validPassword(msg.pass)) return send(c, { t: "pass_result", ok: false, msg: "new password needs 6+ characters, no spaces" });
+      acct.salt = crypto.randomBytes(16).toString("hex");
+      acct.hash = hashPassword(String(msg.pass), acct.salt);
+      // this device stays logged in, every other device has to log in again
+      acct.tokens = c.tokenHash ? [c.tokenHash] : [];
+      acct.tokenHash = acct.tokens[0] || null;
+      if (!DB_URL || !DB_TOKEN) memoryAccounts.set(key, acct);
+      else await db(["SET", "acct:" + key, JSON.stringify(acct)]);
+      c.passTries = 0;
+      console.log(`${c.name} changed their password`);
+      send(c, { t: "pass_result", ok: true, msg: "password changed!" });
+      break;
+    }
+    // ---------- reports (any player)
+    case "report": {
+      const key = String(msg.name || "").toLowerCase();
+      if (!allAccounts.has(key) || key === c.name.toLowerCase()) return send(c, { t: "friend_msg", msg: "cant report that" });
+      if (Date.now() - (c.lastReport || 0) < 30000) return send(c, { t: "friend_msg", msg: "wait a bit before reporting again" });
+      c.lastReport = Date.now();
+      await addReport({ from: c.name, name: displayName(key), reason: String(msg.reason || "").replace(/[\r\n]+/g, " ").slice(0, 120), at: Date.now() });
+      send(c, { t: "friend_msg", msg: "reported " + displayName(key) + ", thanks!" });
+      for (const s of sessions.values()) if (isOwnerName(s.name)) send(s, { t: "admin_done", msg: "new report about " + displayName(key) });
+      break;
+    }
+    // ---------- owner: server pages
+    case "admin_matches": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const list = [];
+      for (const r of rooms.values()) {
+        const A = sessions.get(r.a);
+        const B = sessions.get(r.b);
+        if (!A || !B) continue;
+        list.push({
+          a: A.name,
+          b: B.name,
+          song: r.songName || "picking...",
+          sa: (r.scores && r.scores[r.a]) || 0,
+          sb: (r.scores && r.scores[r.b]) || 0,
+          wa: r.wins[r.a],
+          wb: r.wins[r.b],
+          round: r.round,
+          ranked: r.ranked,
+          bestOf: r.bestOf,
+          watchers: r.spectators.size,
+        });
+      }
+      send(c, { t: "admin_matches", list });
+      break;
+    }
+    case "admin_stats": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const td = todayStats();
+      let online = 0;
+      for (const s of sessions.values()) if (!s.kickMsg) online++;
+      const top = Object.entries(td.songs).sort((x, y) => y[1] - x[1]).slice(0, 5);
+      send(c, {
+        t: "admin_stats",
+        stats: { online, searching: queue.length, matches: rooms.size, rooms: privateRooms.size, peak: td.peak, matchesToday: td.matches, newAccounts: td.newAccounts, accounts: allAccounts.size, banned: (await listBans()).length, topSongs: top, upMins: Math.round(process.uptime() / 60) },
+      });
+      break;
+    }
+    case "admin_reports": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      send(c, { t: "admin_reports", list: await getReports() });
+      break;
+    }
+    case "admin_clear_report": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      let list = await getReports();
+      if (msg.all === true) list = [];
+      else list = list.filter((r) => !(r.at === msg.at && r.from === msg.from));
+      await setReports(list);
+      send(c, { t: "admin_reports", list });
+      break;
+    }
+    case "admin_settings": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      if (msg.maintenance === true || msg.maintenance === false) {
+        serverConfig.maintenance = msg.maintenance;
+        console.log(`maintenance ${msg.maintenance ? "ON" : "OFF"}`);
+        if (msg.maintenance) {
+          for (const s of sessions.values()) if (!isOwnerName(s.name)) send(s, { t: "announce", msg: "Server under maintenance, be back soon!", id: newId() });
+          for (const sid of [...queue]) {
+            const s = sessions.get(sid);
+            if (s && !isOwnerName(s.name)) {
+              leaveQueue(s);
+              send(s, { t: "error", code: "maint", msg: "Server under maintenance, be back soon!" });
+            }
+          }
+        }
+      }
+      if (typeof msg.news === "string") {
+        const text = msg.news.slice(0, 300).trim();
+        serverConfig.news = text ? { id: newId(), text } : null;
+      }
+      if (typeof msg.blockMod === "string") {
+        const k = simpleKey(msg.blockMod);
+        if (k && !serverConfig.blockedMods.includes(k)) serverConfig.blockedMods.push(k);
+      }
+      if (typeof msg.unblockMod === "string") serverConfig.blockedMods = serverConfig.blockedMods.filter((m) => m !== msg.unblockMod);
+      await saveConfig();
+      send(c, { t: "admin_settings", settings: serverConfig });
+      break;
+    }
+    // ---------- owner: account tools
+    case "admin_mute": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const key = String(msg.name || "").toLowerCase();
+      const mins = Math.max(0, Number(msg.mins) || 0);
+      if (msg.off === true) await setKV("mutes", key, null);
+      else await setKV("mutes", key, { until: mins ? Date.now() + mins * 60000 : 0 });
+      send(c, { t: "admin_done", msg: msg.off === true ? "unmuted " + displayName(key) : "muted " + displayName(key) + (mins ? " for " + timeLeft(Date.now() + mins * 60000) : " forever") });
+      break;
+    }
+    case "admin_badge": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const key = String(msg.name || "").toLowerCase();
+      const badge = String(msg.badge || "").toUpperCase().replace(/[^A-Z0-9 !?+-]/g, "").slice(0, 10).trim();
+      await setKV("badges", key, badge ? badge : null);
+      if (badge) badgeCache[key] = badge;
+      else delete badgeCache[key];
+      send(c, { t: "admin_done", msg: badge ? "gave " + displayName(key) + " the " + badge + " badge" : "removed the badge of " + displayName(key) });
+      break;
+    }
+    case "admin_setrating": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const key = String(msg.name || "").toLowerCase();
+      const r = Math.max(0, Math.min(5000, Math.round(Number(msg.rating) || 0)));
+      const st = await getStats(key);
+      st.rating = r;
+      await saveStats(key, st);
+      send(c, { t: "admin_done", msg: displayName(key) + " is now " + rankName(r) + " " + r });
+      break;
+    }
+    case "admin_rename": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const oldKey = String(msg.name || "").toLowerCase();
+      const newName = String(msg.newName || "");
+      const newKey = newName.toLowerCase();
+      if (!validName(newName)) return send(c, { t: "admin_done", msg: "bad new name (3-16, no spaces)" });
+      if (allAccounts.has(newKey) || (await getAccount(newKey))) return send(c, { t: "admin_done", msg: newName + " is taken" });
+      const acct = await getAccount(oldKey);
+      if (!acct) return send(c, { t: "admin_done", msg: "no account called " + msg.name });
+      acct.name = newName;
+      if (!(await createAccount(newKey, acct))) return send(c, { t: "admin_done", msg: "couldnt rename, try again" });
+      // move rank, friends, badge
+      const st = await getStats(oldKey);
+      await saveStats(newKey, st);
+      const friends = await getFriends(oldKey);
+      for (const f of friends) {
+        await setFriend(newKey, f, true);
+        await setFriend(f, oldKey, false);
+        await setFriend(f, newKey, true);
+      }
+      const badge = badgeOf(oldKey);
+      if (badge) {
+        await setKV("badges", newKey, badge);
+        badgeCache[newKey] = badge;
+      }
+      await deleteAccount(oldKey);
+      allAccounts.set(newKey, newName);
+      for (const s of sessions.values()) if (s.name.toLowerCase() === oldKey) kickSession(s, "ur account got renamed to " + newName + ", log in with that name");
+      console.log(`owner renamed ${oldKey} to ${newName}`);
+      send(c, { t: "admin_done", msg: "renamed to " + newName });
+      break;
+    }
+    case "admin_delete": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const key = String(msg.name || "").toLowerCase();
+      if (isOwnerName(key)) return send(c, { t: "admin_done", msg: "cant delete an owner" });
+      if (!allAccounts.has(key) && !(await getAccount(key))) return send(c, { t: "admin_done", msg: "no account called " + msg.name });
+      for (const s of sessions.values()) if (s.name.toLowerCase() === key) kickSession(s, "ur account was deleted");
+      const name = displayName(key);
+      await deleteAccount(key);
+      console.log(`owner deleted ${name}`);
+      send(c, { t: "admin_done", msg: "deleted " + name });
+      break;
+    }
+    // ---------- more owner tools
+    case "admin_info": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const key = String(msg.name || "").toLowerCase();
+      const acct = await getAccount(key);
+      if (!acct) return send(c, { t: "admin_done", msg: "no account called " + msg.name });
+      const s = findSessionByName(key);
+      const room = s ? rooms.get(s.room) : null;
+      let opponent = null;
+      if (room && s) {
+        const o = sessions.get(room.a === s.sid ? room.b : room.a);
+        opponent = o ? o.name : null;
+      }
+      const st = await getStats(key);
+      const friends = (await getFriends(key)).length;
+      let hostedRoom = s && s.hostCode ? s.hostCode : null;
+      if (!hostedRoom) for (const [code, r] of privateRooms) if (r.name.toLowerCase() === key) hostedRoom = code;
+      send(c, {
+        t: "admin_info",
+        info: {
+          name: acct.name,
+          online: !!s,
+          status: statusOf(s),
+          roomCode: hostedRoom,
+          opponent,
+          match: room ? (room.ranked ? "ranked" : "private") + (room.bestOf === 1 ? ", normal round" : ", best of 3") + ", round " + room.round : null,
+          spectating: s && s.spectating ? true : false,
+          device: s && s.device ? s.device : null,
+          onlineFor: s ? Math.round((Date.now() - s.joined) / 60000) : null,
+          lastSeen: s ? null : await getSeen(key),
+          created: acct.created || null,
+          devices: (acct.tokens || [acct.tokenHash]).filter((x) => x).length,
+          banned: await isBanned(key),
+          owner: isOwnerName(key),
+          friends,
+          stats: publicStats(key, st),
+          games: st.games,
+        },
+      });
+      break;
+    }
+    case "admin_resetpass": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const key = String(msg.name || "").toLowerCase();
+      if (isOwnerName(key)) return send(c, { t: "admin_done", msg: "cant do that to an owner" });
+      const acct = await getAccount(key);
+      if (!acct) return send(c, { t: "admin_done", msg: "no account called " + msg.name });
+      // new random password, every logged in device gets logged out
+      const temp = crypto.randomBytes(6).toString("base64").replace(/[^A-Za-z0-9]/g, "").slice(0, 8) || "fnf" + Math.floor(Math.random() * 99999);
+      acct.salt = crypto.randomBytes(16).toString("hex");
+      acct.hash = hashPassword(temp, acct.salt);
+      acct.tokens = [];
+      acct.tokenHash = null;
+      if (!DB_URL || !DB_TOKEN) memoryAccounts.set(key, acct);
+      else await db(["SET", "acct:" + key, JSON.stringify(acct)]);
+      for (const s of sessions.values()) if (s.name.toLowerCase() === key) kickSession(s, "ur password was reset by the owner, log in again");
+      console.log(`owner ${c.name} reset the password of ${acct.name}`);
+      send(c, { t: "admin_done", msg: "new password for " + acct.name + ": " + temp, keep: true });
+      break;
+    }
+    case "admin_dm": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const target = findSessionByName(String(msg.name || ""));
+      const text = String(msg.msg || "").replace(/[\r\n]+/g, " ").slice(0, 120).trim();
+      if (!target) return send(c, { t: "admin_done", msg: msg.name + " isnt online" });
+      if (!text) return;
+      send(target, { t: "announce", msg: "(message from the owner) " + text, id: newId() });
+      send(c, { t: "admin_done", msg: "sent to " + target.name });
+      break;
+    }
+    case "admin_resetrank": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const key = String(msg.name || "").toLowerCase();
+      if (!allAccounts.has(key) && !(await getAccount(key))) return send(c, { t: "admin_done", msg: "no account called " + msg.name });
+      const fresh = newStats();
+      statsCache.set(key, fresh);
+      if (!DB_URL || !DB_TOKEN) memoryStats.set(key, fresh);
+      else {
+        await db(["SET", "stats:" + key, JSON.stringify(fresh)]);
+        await db(["ZREM", "lb", key]);
+      }
+      send(c, { t: "admin_done", msg: "reset the rank of " + displayName(key) });
+      break;
+    }
+    case "admin_endmatch": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const target = findSessionByName(String(msg.name || ""));
+      const room = target ? rooms.get(target.room) : null;
+      if (!room) return send(c, { t: "admin_done", msg: (msg.name || "they") + " isnt in a match" });
+      room.over = true; // no rank change for this
+      const A = sessions.get(room.a);
+      const B = sessions.get(room.b);
+      for (const p of [A, B]) if (p) kickSession(p, "the owner ended ur match");
+      send(c, { t: "admin_done", msg: "ended the match of " + target.name });
       break;
     }
     case "leave":
       leaveRoom(c);
       break;
     case "relay": {
+      const room = rooms.get(c.room);
+      // blocked mods cant be picked online
+      if (msg.data && msg.data.type === "pick" && msg.data.mod && serverConfig.blockedMods.length) {
+        const k = simpleKey(msg.data.mod.title || msg.data.mod.id);
+        if (serverConfig.blockedMods.includes(k)) return send(c, { t: "pick_blocked", name: msg.data.mod.title || msg.data.mod.id });
+      }
+      if (room && msg.data && typeof msg.data === "object") {
+        if (msg.data.type === "pick") {
+          room.songName = String(msg.data.name || msg.data.song || "?").slice(0, 60);
+          room.scores = {};
+          const td = todayStats();
+          td.songs[room.songName] = (td.songs[room.songName] || 0) + 1;
+        }
+        if (msg.data.type === "score" || msg.data.type === "done") {
+          if (!room.scores) room.scores = {};
+          room.scores[c.sid] = Number(msg.data.score) || 0;
+        }
+      }
       // gameplay stuff (ready, score, done) goes straight to the opponent
       send(opponentOf(c), { t: "relay", data: msg.data });
-      const room = rooms.get(c.room);
       if (room && msg.data && typeof msg.data === "object") {
         const ty = msg.data.type;
         if (ty === "ready") {
@@ -986,14 +1494,59 @@ async function handle(c, msg) {
       if (!key || key === c.name.toLowerCase()) return send(c, { t: "friend_msg", msg: "cant add urself lol" });
       if (!allAccounts.has(key) && !(await getAccount(key))) return send(c, { t: "friend_msg", msg: "theres no account called " + msg.name });
       const list = await getFriends(c.name);
+      if (list.includes(key)) return send(c, { t: "friend_msg", msg: displayName(key) + " is already ur friend" });
       if (list.length >= 100) return send(c, { t: "friend_msg", msg: "friends list is full (100)" });
-      await setFriend(c.name, key, true);
-      send(c, { t: "friend_msg", msg: "added " + displayName(key) + "!" });
+      const target = findSessionByName(key);
+      // they already asked me: just be friends
+      if ((await getRequests(c.name)).includes(key)) {
+        await makeFriends(c.name, key);
+        send(c, { t: "friend_msg", msg: "ur friends with " + displayName(key) + " now!" });
+        await sendFriends(c);
+        await sendRequests(c);
+        if (target) {
+          send(target, { t: "friend_msg", msg: c.name + " accepted ur friend request!" });
+          await sendFriends(target);
+        }
+        break;
+      }
+      if ((await getRequests(key)).length >= 50) return send(c, { t: "friend_msg", msg: displayName(key) + " has too many requests rn" });
+      await setRequest(key, c.name, true);
+      send(c, { t: "friend_msg", msg: "friend request sent to " + displayName(key) + "!" });
+      if (target) {
+        send(target, { t: "friend_request", from: c.name });
+        await sendFriends(target);
+      }
+      break;
+    }
+    case "friend_requests":
+      await sendRequests(c);
+      break;
+    case "friend_accept": {
+      const key = String(msg.name || "").toLowerCase();
+      if (!(await getRequests(c.name)).includes(key)) return send(c, { t: "friend_msg", msg: "that request is gone" });
+      if ((await getFriends(c.name)).length >= 100) return send(c, { t: "friend_msg", msg: "friends list is full (100)" });
+      await makeFriends(c.name, key);
+      send(c, { t: "friend_msg", msg: "ur friends with " + displayName(key) + " now!" });
+      await sendFriends(c);
+      await sendRequests(c);
+      const target = findSessionByName(key);
+      if (target) {
+        send(target, { t: "friend_msg", msg: c.name + " accepted ur friend request!" });
+        await sendFriends(target);
+      }
+      break;
+    }
+    case "friend_decline": {
+      await setRequest(c.name, String(msg.name || ""), false);
+      send(c, { t: "friend_msg", msg: "declined " + msg.name });
+      await sendRequests(c);
       await sendFriends(c);
       break;
     }
     case "friend_remove": {
+      // unfriending works both ways
       await setFriend(c.name, String(msg.name || ""), false);
+      await setFriend(String(msg.name || ""), c.name, false);
       send(c, { t: "friend_msg", msg: "removed " + msg.name });
       await sendFriends(c);
       break;
@@ -1016,6 +1569,8 @@ async function handle(c, msg) {
       const text = String(msg.text || "").replace(/[\r\n]+/g, " ").slice(0, 200).trim();
       const sticker = typeof msg.sticker === "string" && STICKER_RE.test(msg.sticker) && !msg.sticker.includes("..") ? msg.sticker : null;
       if (!text && !sticker) return;
+      const mute = await getKV("mutes", c.name.toLowerCase());
+      if (mute && (!mute.until || Date.now() < mute.until)) return send(c, { t: "friend_msg", msg: "ur muted" + (mute.until ? " for " + timeLeft(mute.until) : "") });
       const last = c.lastChat || 0;
       if (Date.now() - last < 600) return send(c, { t: "friend_msg", msg: "slow down lol" });
       c.lastChat = Date.now();
@@ -1076,8 +1631,27 @@ async function handle(c, msg) {
   }
 }
 
+// when each account was last online (owner info)
+const lastSeenMap = new Map();
+function markSeen(name) {
+  const key = String(name).toLowerCase();
+  lastSeenMap.set(key, Date.now());
+  if (DB_URL && DB_TOKEN) db(["HSET", "seen", key, String(Date.now())]).catch(() => {});
+}
+async function getSeen(key) {
+  if (lastSeenMap.has(key)) return lastSeenMap.get(key);
+  if (!DB_URL || !DB_TOKEN) return null;
+  try {
+    const v = await db(["HGET", "seen", key]);
+    return v ? Number(v) : null;
+  } catch {
+    return null;
+  }
+}
+
 function removeSession(c) {
   if (!sessions.has(c.sid)) return;
+  markSeen(c.name);
   for (const r of rooms.values()) r.spectators.delete(c.sid);
   leaveQueue(c);
   leaveRoom(c);
@@ -1099,7 +1673,7 @@ async function onPoll(body) {
     if (hello.protocol !== PROTOCOL) return { msgs: [{ t: "error", msg: "ur mod is outdated! get the new version from GameBanana" }] };
     const realName = await checkToken(hello.name, hello.token);
     if (!realName) return { msgs: [{ t: "error", code: "auth", msg: "log in again" }] };
-    if (await isBanned(realName)) return { msgs: [{ t: "error", code: "banned", msg: "this account is banned" }] };
+    if (await isBanned(realName)) return { msgs: [{ t: "error", code: "banned", msg: await banMessage(realName.toLowerCase()) }] };
     // same account logging in twice: kick the old one
     for (const old of [...sessions.values()])
       if (old.name.toLowerCase() === realName.toLowerCase()) {
@@ -1108,9 +1682,15 @@ async function onPoll(body) {
         leaveRoom(old);
         old.kickMsg = "ur account logged in on another device";
       }
-    c = { sid: newId(), name: realName, room: null, inbox: [], lastSeen: Date.now() };
+    c = { sid: newId(), name: realName, room: null, inbox: [], lastSeen: Date.now(), joined: Date.now(), device: String(hello.device || "").slice(0, 12), tokenHash: sha(hello.token) };
     sessions.set(c.sid, c);
-    send(c, { t: "welcome", name: c.name, online: sessions.size, owner: isOwnerName(c.name) });
+    {
+      let n = 0;
+      for (const s of sessions.values()) if (!s.kickMsg) n++;
+      const td = todayStats();
+      if (n > td.peak) td.peak = n;
+    }
+    send(c, { t: "welcome", name: c.name, online: sessions.size, owner: isOwnerName(c.name), maintenance: !!serverConfig.maintenance });
     if (lastAnnounce && Date.now() - lastAnnounce.at < 10 * 60000) send(c, { t: "announce", msg: lastAnnounce.msg, id: lastAnnounce.id });
   }
 
@@ -1253,7 +1833,17 @@ p{color:#bbb;font-size:17px}</style></head><body>
     for (const c of sessions.values()) if (!c.kickMsg) online++;
     res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
     const ann = lastAnnounce && Date.now() - lastAnnounce.at < 10 * 60000 ? lastAnnounce : null;
-    res.end(JSON.stringify({ online, searching: queue.length, matches: rooms.size, announce: ann ? ann.msg : null, announceId: ann ? ann.id : null }));
+    res.end(
+      JSON.stringify({
+        online,
+        searching: queue.length,
+        matches: rooms.size,
+        announce: ann ? ann.msg : null,
+        announceId: ann ? ann.id : null,
+        maintenance: !!serverConfig.maintenance,
+        news: serverConfig.news,
+      })
+    );
     return;
   }
 
@@ -1294,6 +1884,7 @@ setInterval(() => {
 }, 5000);
 
 loadAllAccounts();
+loadConfig();
 
 server.listen(PORT, () => {
   console.log(`fnf online server on port ${PORT}`);
