@@ -53,6 +53,37 @@ async function createAccount(key, acct) {
   return (await db(["SET", "acct:" + key, JSON.stringify(acct), "NX"])) === "OK";
 }
 
+// every account name (lowercase -> how they typed it), kept in memory so the owner list is free
+const allAccounts = new Map();
+
+async function loadAllAccounts() {
+  if (!DB_URL || !DB_TOKEN) return;
+  try {
+    let cursor = "0";
+    const keys = [];
+    do {
+      const [next, batch] = await db(["SCAN", cursor, "MATCH", "acct:*", "COUNT", "500"]);
+      cursor = String(next);
+      keys.push(...batch);
+    } while (cursor !== "0");
+    for (let i = 0; i < keys.length; i += 100) {
+      const chunk = keys.slice(i, i + 100);
+      const vals = await db(["MGET", ...chunk]);
+      vals.forEach((v, j) => {
+        const lower = chunk[j].slice(5);
+        let display = lower;
+        try {
+          display = JSON.parse(v).name || lower;
+        } catch {}
+        allAccounts.set(lower, display);
+      });
+    }
+    console.log(`loaded ${allAccounts.size} accounts`);
+  } catch (e) {
+    console.log("couldnt load account list:", e.message);
+  }
+}
+
 // ------------------------------------------------------------ owner + bans
 // accounts in OWNERS (Render > Environment, comma separated) can use owner tools. default: Owner
 const OWNERS = (process.env.OWNERS || "Owner").split(",").map((n) => n.trim().toLowerCase()).filter(Boolean);
@@ -134,6 +165,7 @@ async function onAuth(body, ip) {
     const token = crypto.randomBytes(32).toString("hex");
     acct = { name, salt, hash: hashPassword(password, salt), tokenHash: sha(token), created: Date.now() };
     if (!(await createAccount(key, acct))) return { ok: false, error: "that name just got taken, try again" };
+    allAccounts.set(key, name);
     console.log(`new account: ${name}`);
     return { ok: true, created: true, name, token };
   }
@@ -290,7 +322,9 @@ async function handle(c, msg) {
       const players = [...sessions.values()]
         .filter((s) => !s.kickMsg)
         .map((s) => ({ name: s.name, status: s.room ? "in a match" : queue.includes(s.sid) ? "searching" : s.hostCode ? "private room" : "menu" }));
-      send(c, { t: "admin_list", players, banned: await listBans() });
+      // memory mode: accounts only live in memoryAccounts
+      if (!DB_URL || !DB_TOKEN) for (const [k, a] of memoryAccounts) allAccounts.set(k, a.name);
+      send(c, { t: "admin_list", players, accounts: [...allAccounts.values()], banned: await listBans() });
       break;
     }
     case "admin_kick":
@@ -412,6 +446,8 @@ setInterval(() => {
     if (now - c.lastSeen > SESSION_TIMEOUT_MS) removeSession(c);
   }
 }, 5000);
+
+loadAllAccounts();
 
 server.listen(PORT, () => {
   console.log(`fnf online server on port ${PORT}`);
