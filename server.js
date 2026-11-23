@@ -7,6 +7,12 @@
 
 const http = require("http");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const { spawn } = require("child_process");
+const { Readable } = require("stream");
+const { pipeline } = require("stream/promises");
 
 const PORT = Number(process.env.PORT || 7777);
 const PROTOCOL = 4;
@@ -193,6 +199,179 @@ async function checkToken(name, token) {
   return list.some((t) => sameHex(t, h)) ? acct.name : null;
 }
 
+// ------------------------------------------------------------ mod packer
+// The game can only unzip plain .zip files. The server downloads the mod from GameBanana
+// (zip, rar or 7z), unpacks it with 7-Zip, finds the V-Slice mod folder and repacks just that as a clean zip.
+const SEVEN_ZIP = process.env.SEVEN_ZIP || path.join(__dirname, "7zz");
+const MOD_DIR = path.join(os.tmpdir(), "fnf-mods");
+const MAX_MOD_BYTES = 1.5 * 1024 * 1024 * 1024;
+const modJobs = new Map(); // id -> {state, pct, msg, file, size, touched}
+
+function allowedModUrl(u) {
+  if (process.env.ALLOW_ANY_MOD_URL === "1") return true; // local testing only
+  try {
+    const url = new URL(u);
+    return url.protocol === "https:" && (url.hostname === "gamebanana.com" || url.hostname.endsWith(".gamebanana.com"));
+  } catch {
+    return false;
+  }
+}
+
+function run7z(args, cwd) {
+  return new Promise((resolve, reject) => {
+    try {
+      fs.chmodSync(SEVEN_ZIP, 0o755);
+    } catch {}
+    const p = spawn(SEVEN_ZIP, args, { cwd, stdio: ["ignore", "ignore", "pipe"] });
+    let err = "";
+    p.stderr.on("data", (d) => (err += d).slice(-2000));
+    p.on("error", (e) => reject(new Error("7-Zip missing on the server (" + e.message + ")")));
+    p.on("close", (code) => (code === 0 || code === 1 ? resolve() : reject(new Error("unpacking failed: " + err.slice(-200)))));
+  });
+}
+
+function findModRoot(dir, depth = 0) {
+  // shallowest folder that has _polymod_meta.json
+  if (fs.existsSync(path.join(dir, "_polymod_meta.json"))) return dir;
+  if (depth > 5) return null;
+  let found = null;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === "__MACOSX") continue;
+    const r = findModRoot(path.join(dir, entry.name), depth + 1);
+    if (r && (!found || r.length < found.length)) found = r;
+  }
+  return found;
+}
+
+function cleanupOldMods() {
+  // keep only the newest few finished mods on disk
+  const done = [...modJobs.entries()].filter(([, j]) => j.state === "ready").sort((a, b) => b[1].touched - a[1].touched);
+  for (const [id, j] of done.slice(3)) {
+    try {
+      fs.rmSync(path.dirname(j.file), { recursive: true, force: true });
+    } catch {}
+    modJobs.delete(id);
+  }
+}
+
+async function prepareMod(id, url) {
+  const job = modJobs.get(id);
+  const work = path.join(MOD_DIR, id);
+  fs.rmSync(work, { recursive: true, force: true });
+  fs.mkdirSync(work, { recursive: true });
+  try {
+    // 1) download from GameBanana
+    job.state = "downloading";
+    const res = await fetch(url, { redirect: "follow", headers: { "User-Agent": "FNF-Online-Server" } });
+    if (!res.ok) throw new Error("GameBanana said " + res.status);
+    const total = Number(res.headers.get("content-length") || 0);
+    if (total > MAX_MOD_BYTES) throw new Error("mod is too big for the server (" + Math.round(total / 1048576) + " MB)");
+    const nameFromUrl = decodeURIComponent(new URL(res.url).pathname.split("/").pop() || "mod.bin");
+    const ext = (path.extname(nameFromUrl) || ".bin").toLowerCase();
+    const src = path.join(work, "source" + ext);
+    let got = 0;
+    const counter = new (require("stream").Transform)({
+      transform(chunk, _enc, cb) {
+        got += chunk.length;
+        if (got > MAX_MOD_BYTES) return cb(new Error("mod is too big for the server"));
+        if (total) job.pct = Math.floor((got / total) * 100);
+        cb(null, chunk);
+      },
+    });
+    await pipeline(Readable.fromWeb(res.body), counter, fs.createWriteStream(src));
+
+    // 2) unpack (zip, rar, 7z, anything 7-Zip knows)
+    job.state = "unpacking";
+    job.pct = 0;
+    const out = path.join(work, "x");
+    fs.mkdirSync(out);
+    await run7z(["x", src, "-o" + out, "-y", "-bso0", "-bsp0"], work);
+    fs.rmSync(src, { force: true });
+
+    // 3) find the actual mod folder
+    const root = findModRoot(out);
+    if (!root) throw new Error("thats not a V-Slice mod (no _polymod_meta.json inside)");
+
+    // 4) repack as a plain zip the game can read
+    job.state = "packing";
+    const zip = path.join(work, "mod.zip");
+    await run7z(["a", "-tzip", "-mx=1", "-bso0", "-bsp0", zip, "."], root);
+    fs.rmSync(out, { recursive: true, force: true });
+
+    job.file = zip;
+    job.size = fs.statSync(zip).size;
+    job.state = "ready";
+    job.pct = 100;
+    job.touched = Date.now();
+    console.log(`mod ready: ${url} (${Math.round(job.size / 1048576)} MB)`);
+    cleanupOldMods();
+  } catch (e) {
+    job.state = "error";
+    job.msg = e.message;
+    console.log(`mod failed: ${url}: ${e.message}`);
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+}
+
+// ---------- player to player mod transfer
+// the picker's game zips their mod folder and uploads it in small base64 chunks,
+// the other player downloads the finished zip from /modfile
+const MAX_UPLOAD_BYTES = 700 * 1024 * 1024;
+
+function safeJobId(id) {
+  return /^[A-Za-z0-9_.-]{3,120}$/.test(String(id || ""));
+}
+
+function onModChunk(body) {
+  const id = "up-" + String(body.id || "");
+  if (!safeJobId(id)) return { ok: false, error: "bad id" };
+  const i = Number(body.i);
+  const n = Number(body.n);
+  if (!Number.isInteger(i) || !Number.isInteger(n) || i < 0 || n < 1 || i >= n || n > 1000) return { ok: false, error: "bad chunk" };
+  const data = Buffer.from(String(body.data || ""), "base64");
+  const dir = path.join(MOD_DIR, id);
+  const file = path.join(dir, "mod.zip");
+  let job = modJobs.get(id);
+  if (i === 0) {
+    // (re)start the upload
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true });
+    job = { state: "uploading", pct: 0, msg: "", file, size: 0, next: 0, touched: Date.now() };
+    modJobs.set(id, job);
+  }
+  if (!job || job.state !== "uploading") return { ok: false, error: "upload not started" };
+  if (i !== job.next) return { ok: false, error: "chunk out of order", expected: job.next };
+  if (job.size + data.length > MAX_UPLOAD_BYTES) {
+    job.state = "error";
+    job.msg = "mod is too big to send (over 700 MB)";
+    fs.rmSync(dir, { recursive: true, force: true });
+    return { ok: false, error: job.msg };
+  }
+  fs.appendFileSync(file, data);
+  job.size += data.length;
+  job.next = i + 1;
+  job.pct = Math.floor(((i + 1) / n) * 100);
+  job.touched = Date.now();
+  if (job.next === n) {
+    job.state = "ready";
+    console.log(`mod uploaded: ${id} (${Math.round(job.size / 1048576)} MB)`);
+    cleanupOldMods();
+  }
+  return { ok: true, next: job.next, state: job.state };
+}
+
+function startModJob(url) {
+  const id = crypto.createHash("sha1").update(url).digest("hex").slice(0, 16);
+  const existing = modJobs.get(id);
+  if (existing && existing.state !== "error") {
+    existing.touched = Date.now();
+    return id;
+  }
+  modJobs.set(id, { state: "queued", pct: 0, msg: "", file: null, size: 0, touched: Date.now() });
+  prepareMod(id, url);
+  return id;
+}
+
 function newId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
@@ -247,15 +426,24 @@ function tryMatch() {
   broadcastQueueCount();
 }
 
-// private rooms: code -> host sid
+// private rooms: code -> { name (host account), made }
+// kept by account name so the host can drop out for a bit (game paused, phone in background) and come back
 const privateRooms = new Map();
-const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O or 1/I mixups
+const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ"; // letters only (game font has no numbers), no I/O mixups
+const ROOM_LIFE_MS = 20 * 60 * 1000;
+const HOST_TIMEOUT_MS = 10 * 60 * 1000; // hosts waiting for a friend stay longer
 
 function closeHostedRoom(c) {
   if (c.hostCode) {
     privateRooms.delete(c.hostCode);
     c.hostCode = null;
   }
+}
+
+function findSessionByName(name) {
+  const low = String(name).toLowerCase();
+  for (const s of sessions.values()) if (!s.kickMsg && s.name.toLowerCase() === low) return s;
+  return null;
 }
 
 function newRoomCode() {
@@ -297,18 +485,36 @@ async function handle(c, msg) {
     case "create_room": {
       leaveQueue(c);
       leaveRoom(c);
+      // reconnecting host asks for the same code back
+      const want = String(msg.code || "").toUpperCase().trim();
+      const old = want ? privateRooms.get(want) : null;
+      if (old && old.name.toLowerCase() === c.name.toLowerCase()) {
+        if (c.hostCode && c.hostCode !== want) closeHostedRoom(c);
+        old.made = Date.now();
+        c.hostCode = want;
+        return send(c, { t: "room_created", code: want });
+      }
       closeHostedRoom(c);
       const code = newRoomCode();
       if (!code) return send(c, { t: "error", code: "room", msg: "couldnt make a room, try again" });
-      privateRooms.set(code, c.sid);
+      privateRooms.set(code, { name: c.name, made: Date.now() });
       c.hostCode = code;
+      console.log(`room ${code} made by ${c.name}`);
       send(c, { t: "room_created", code });
       break;
     }
     case "join_room": {
-      const code = String(msg.code || "").toUpperCase().trim();
-      const host = sessions.get(privateRooms.get(code));
-      if (!host || host === c || host.kickMsg) return send(c, { t: "error", code: "room", msg: "room not found, check the code" });
+      const code = String(msg.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+      const entry = privateRooms.get(code);
+      if (!entry) {
+        console.log(`join ${code} by ${c.name}: no such room (rooms: ${[...privateRooms.keys()].join(",") || "none"})`);
+        return send(c, { t: "error", code: "room", msg: "room " + code + " not found, check the code" });
+      }
+      if (entry.name.toLowerCase() === c.name.toLowerCase())
+        return send(c, { t: "error", code: "room", msg: "thats ur own room! ur friend has to join\n(2 devices need 2 different accounts)" });
+      const host = findSessionByName(entry.name);
+      if (!host || host.hostCode !== code || host.room)
+        return send(c, { t: "error", code: "room", msg: entry.name + " isnt in the room rn.\ntell them to keep FNF open on the room screen" });
       leaveQueue(c);
       leaveRoom(c);
       closeHostedRoom(c);
@@ -385,7 +591,13 @@ async function onPoll(body) {
     if (!realName) return { msgs: [{ t: "error", code: "auth", msg: "log in again" }] };
     if (await isBanned(realName)) return { msgs: [{ t: "error", code: "banned", msg: "this account is banned" }] };
     // same account logging in twice: kick the old one
-    for (const old of [...sessions.values()]) if (old.name.toLowerCase() === realName.toLowerCase()) removeSession(old);
+    for (const old of [...sessions.values()])
+      if (old.name.toLowerCase() === realName.toLowerCase()) {
+        old.hostCode = null; // room stays, the new login can take it back
+        leaveQueue(old);
+        leaveRoom(old);
+        old.kickMsg = "ur account logged in on another device";
+      }
     c = { sid: newId(), name: realName, room: null, inbox: [], lastSeen: Date.now() };
     sessions.set(c.sid, c);
     send(c, { t: "welcome", name: c.name, online: sessions.size, owner: isOwnerName(c.name) });
@@ -434,6 +646,71 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ---------- mod upload from a player
+  if (req.method === "POST" && req.url.startsWith("/modchunk")) {
+    const chunks = [];
+    let len = 0;
+    req.on("data", (chunk) => {
+      len += chunk.length;
+      if (len > 6 * 1024 * 1024) return req.destroy(); // one chunk max ~4MB of base64
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      let body = {};
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      } catch {}
+      let result;
+      try {
+        result = onModChunk(body);
+      } catch (e) {
+        result = { ok: false, error: "server error: " + e.message };
+      }
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify(result));
+    });
+    return;
+  }
+
+  // ---------- mod packer endpoints
+  if (req.method === "POST" && req.url.startsWith("/modprep")) {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+      if (data.length > 4096) req.destroy();
+    });
+    req.on("end", () => {
+      let body = {};
+      try {
+        body = JSON.parse(data || "{}");
+      } catch {}
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      if (!allowedModUrl(body.url)) return res.end(JSON.stringify({ ok: false, error: "only GameBanana downloads are allowed" }));
+      res.end(JSON.stringify({ ok: true, job: startModJob(body.url) }));
+    });
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/modstatus")) {
+    const id = new URL(req.url, "http://x").searchParams.get("job");
+    const j = modJobs.get(id);
+    if (j) j.touched = Date.now();
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify(j ? { state: j.state, pct: j.pct, msg: j.msg, size: j.size } : { state: "error", msg: "job not found" }));
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/modfile")) {
+    const id = new URL(req.url, "http://x").searchParams.get("job");
+    const j = modJobs.get(id);
+    if (!j || j.state !== "ready" || !fs.existsSync(j.file)) {
+      res.writeHead(404);
+      return res.end("not ready");
+    }
+    j.touched = Date.now();
+    res.writeHead(200, { "Content-Type": "application/zip", "Content-Length": j.size });
+    fs.createReadStream(j.file).pipe(res);
+    return;
+  }
+
   // anything else: simple status page, handy to check in a browser
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end(`FNF Online server is running. players online: ${sessions.size}, in queue: ${queue.length}, matches: ${rooms.size}, accounts saved: ${DB_URL && DB_TOKEN ? "yes" : "NO (database not set)"}\n`);
@@ -443,7 +720,15 @@ const server = http.createServer((req, res) => {
 setInterval(() => {
   const now = Date.now();
   for (const c of [...sessions.values()]) {
-    if (now - c.lastSeen > SESSION_TIMEOUT_MS) removeSession(c);
+    const limit = c.hostCode && !c.kickMsg ? HOST_TIMEOUT_MS : SESSION_TIMEOUT_MS;
+    if (now - c.lastSeen > limit) {
+      c.hostCode = null; // dont delete the room, they might come back
+      removeSession(c);
+    }
+  }
+  for (const [code, r] of privateRooms) {
+    const hostOn = findSessionByName(r.name);
+    if (now - r.made > ROOM_LIFE_MS && !(hostOn && hostOn.hostCode === code)) privateRooms.delete(code);
   }
 }, 5000);
 
