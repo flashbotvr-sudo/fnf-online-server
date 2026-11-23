@@ -15,7 +15,7 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 5;
+const PROTOCOL = 6;
 const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
@@ -708,6 +708,15 @@ const server = http.createServer((req, res) => {
     j.touched = Date.now();
     res.writeHead(200, { "Content-Type": "application/zip", "Content-Length": j.size });
     fs.createReadStream(j.file).pipe(res);
+    return;
+  }
+
+  // player count for the online menu
+  if (req.method === "GET" && req.url.startsWith("/online")) {
+    let online = 0;
+    for (const c of sessions.values()) if (!c.kickMsg) online++;
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ online, searching: queue.length, matches: rooms.size }));
     return;
   }
 
