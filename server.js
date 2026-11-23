@@ -15,7 +15,7 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 11;
+const PROTOCOL = 12;
 const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
@@ -273,14 +273,87 @@ function statusOf(s) {
 
 async function sendFriends(c) {
   const list = [];
+  const unread = await getUnread(c.name);
   for (const k of await getFriends(c.name)) {
     const s = findSessionByName(k);
-    list.push({ name: displayName(k), status: statusOf(s), owner: isOwnerName(k) });
+    list.push({ name: displayName(k), status: statusOf(s), owner: isOwnerName(k), unread: unread[k] || 0 });
   }
   // online first, then by name
   list.sort((a, b) => (a.status === "offline") - (b.status === "offline") || a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
   send(c, { t: "friends", list });
 }
+
+// ---------- friend chat (last 50 messages per pair, unread counts)
+const memoryChats = new Map(); // pairKey -> [msgs]
+const memoryUnread = new Map(); // lower name -> Map(from -> count)
+
+function pairKey(a, b) {
+  const x = String(a).toLowerCase();
+  const y = String(b).toLowerCase();
+  return x < y ? x + "|" + y : y + "|" + x;
+}
+
+async function chatHistory(a, b) {
+  const key = pairKey(a, b);
+  if (!DB_URL || !DB_TOKEN) return memoryChats.get(key) || [];
+  try {
+    const list = (await db(["LRANGE", "chat:" + key, "-50", "-1"])) || [];
+    return list.map((x) => {
+      try {
+        return JSON.parse(x);
+      } catch {
+        return null;
+      }
+    }).filter((x) => x);
+  } catch {
+    return [];
+  }
+}
+
+async function chatStore(a, b, msg) {
+  const key = pairKey(a, b);
+  if (!DB_URL || !DB_TOKEN) {
+    const list = memoryChats.get(key) || [];
+    list.push(msg);
+    while (list.length > 50) list.shift();
+    memoryChats.set(key, list);
+    return;
+  }
+  await db(["RPUSH", "chat:" + key, JSON.stringify(msg)]);
+  await db(["LTRIM", "chat:" + key, "-50", "-1"]);
+}
+
+async function addUnread(to, from, n) {
+  const t = String(to).toLowerCase();
+  const f = String(from).toLowerCase();
+  if (!DB_URL || !DB_TOKEN) {
+    if (!memoryUnread.has(t)) memoryUnread.set(t, new Map());
+    const m = memoryUnread.get(t);
+    if (n === 0) m.delete(f);
+    else m.set(f, (m.get(f) || 0) + n);
+    return;
+  }
+  try {
+    if (n === 0) await db(["HDEL", "unread:" + t, f]);
+    else await db(["HINCRBY", "unread:" + t, f, String(n)]);
+  } catch {}
+}
+
+async function getUnread(name) {
+  const t = String(name).toLowerCase();
+  const out = {};
+  if (!DB_URL || !DB_TOKEN) {
+    for (const [k, v] of memoryUnread.get(t) || []) out[k] = v;
+    return out;
+  }
+  try {
+    const r = (await db(["HGETALL", "unread:" + t])) || [];
+    for (let i = 0; i + 1 < r.length; i += 2) out[r[i]] = Number(r[i + 1]) || 0;
+  } catch {}
+  return out;
+}
+
+const STICKER_RE = /^[A-Za-z0-9_\/.-]{1,140}$/;
 
 // announcements from the owner (shown to everyone for a while)
 let lastAnnounce = null; // {msg, id, at}
@@ -936,6 +1009,34 @@ async function handle(c, msg) {
       send(c, { t: "invite_sent", to: target.name });
       break;
     }
+    // ---------- chat
+    case "chat_send": {
+      const toKey = String(msg.to || "").toLowerCase();
+      if (!toKey || toKey === c.name.toLowerCase() || !allAccounts.has(toKey)) return send(c, { t: "friend_msg", msg: "cant send to that account" });
+      const text = String(msg.text || "").replace(/[\r\n]+/g, " ").slice(0, 200).trim();
+      const sticker = typeof msg.sticker === "string" && STICKER_RE.test(msg.sticker) && !msg.sticker.includes("..") ? msg.sticker : null;
+      if (!text && !sticker) return;
+      const last = c.lastChat || 0;
+      if (Date.now() - last < 600) return send(c, { t: "friend_msg", msg: "slow down lol" });
+      c.lastChat = Date.now();
+      const m = { from: c.name, to: displayName(toKey), text, sticker, at: Date.now() };
+      await chatStore(c.name, toKey, m);
+      send(c, { t: "chat_msg", msg: m });
+      const target = findSessionByName(toKey);
+      if (target) send(target, { t: "chat_msg", msg: m });
+      await addUnread(toKey, c.name, 1);
+      break;
+    }
+    case "chat_history": {
+      const withKey = String(msg.with || "").toLowerCase();
+      if (!withKey) return;
+      await addUnread(c.name, withKey, 0); // opened the chat = read
+      send(c, { t: "chat_history", with: displayName(withKey), msgs: await chatHistory(c.name, withKey) });
+      break;
+    }
+    case "chat_read":
+      await addUnread(c.name, String(msg.with || ""), 0);
+      break;
     // ---------- spectating
     case "spectate": {
       const target = findSessionByName(String(msg.name || ""));
