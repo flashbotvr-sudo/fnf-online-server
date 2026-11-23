@@ -15,7 +15,7 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 9;
+const PROTOCOL = 11;
 const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
@@ -625,8 +625,9 @@ async function decideRound(room) {
   const winner = sa > sb ? room.a : sb > sa ? room.b : null;
   if (winner) room.wins[winner]++;
   const roundNo = room.round++;
-  let over = room.wins[room.a] >= 2 || room.wins[room.b] >= 2;
-  if (!over && roundNo >= 5) over = true; // too many ties, call it
+  const need = room.bestOf === 1 ? 1 : 2;
+  let over = room.wins[room.a] >= need || room.wins[room.b] >= need;
+  if (!over && roundNo >= (room.bestOf === 1 ? 1 : 5)) over = true; // normal round ends after 1 song, best of 3 calls it after 5 ties
   let seriesWinner = null;
   if (over) {
     room.over = true;
@@ -659,6 +660,7 @@ async function decideRound(room) {
       over,
       seriesWon: over ? (seriesWinner === null ? null : seriesWinner === me) : null,
       ranked: room.ranked,
+      bestOf: room.bestOf,
     };
     if (ranked) Object.assign(msg, seriesWinner === me ? ranked.win : ranked.lose);
     send(p, msg);
@@ -675,7 +677,9 @@ function broadcastQueueCount() {
   for (const id of queue) send(sessions.get(id), { t: "queued", count: queue.length });
 }
 
-function makeMatch(a, b, isPrivate) {
+function makeMatch(a, b, isPrivate, opts) {
+  opts = opts || {};
+  const bestOf = opts.bestOf === 1 ? 1 : 3;
   const roomId = "r" + newId();
   const song = SONGS[Math.floor(Math.random() * SONGS.length)];
   const room = {
@@ -684,6 +688,7 @@ function makeMatch(a, b, isPrivate) {
     b: b.sid,
     song,
     ranked: !isPrivate, // private rooms dont change ur rank
+    bestOf,
     wins: { [a.sid]: 0, [b.sid]: 0 },
     round: 1,
     reports: {},
@@ -703,17 +708,46 @@ function makeMatch(a, b, isPrivate) {
       const pa = publicStats(a.name, sa);
       const pb = publicStats(b.name, sb);
       // a plays as bf (picks the song), b as dad
-      send(a, { t: "match", room: roomId, song, side: "bf", opponent: b.name, private: !!isPrivate, ranked: room.ranked, me: pa, opp: pb });
-      send(b, { t: "match", room: roomId, song, side: "dad", opponent: a.name, private: !!isPrivate, ranked: room.ranked, me: pb, opp: pa });
+      const extra = { bestOf, common: opts.common || [], modsOnly: !!opts.modsOnly };
+      send(a, { t: "match", room: roomId, song, side: "bf", opponent: b.name, private: !!isPrivate, ranked: room.ranked, me: pa, opp: pb, ...extra });
+      send(b, { t: "match", room: roomId, song, side: "dad", opponent: a.name, private: !!isPrivate, ranked: room.ranked, me: pb, opp: pa, ...extra });
     });
 }
 
+function commonMods(a, b) {
+  const set = new Set(a.mods || []);
+  return (b.mods || []).filter((m) => set.has(m));
+}
+
+// pairs people up: same mode (normal / best of 3), and if either wants matching mods they must share one
+// (the most shared mods wins when theres a choice)
 function tryMatch() {
-  while (queue.length >= 2) {
-    const a = sessions.get(queue.shift());
-    const b = sessions.get(queue.shift());
-    if (!a || !b) continue;
-    makeMatch(a, b, false);
+  for (const sid of [...queue]) if (!sessions.has(sid)) queue.splice(queue.indexOf(sid), 1);
+  let found = true;
+  while (found) {
+    found = false;
+    for (let i = 0; i < queue.length && !found; i++) {
+      const a = sessions.get(queue[i]);
+      let best = null;
+      let bestCommon = null;
+      for (let j = i + 1; j < queue.length; j++) {
+        const b = sessions.get(queue[j]);
+        if (!b || (a.queueMode || "bo3") !== (b.queueMode || "bo3")) continue;
+        const common = commonMods(a, b);
+        if ((a.matchMods || b.matchMods) && common.length === 0) continue;
+        if (!best || common.length > bestCommon.length) {
+          best = b;
+          bestCommon = common;
+        }
+        if (!a.matchMods && !b.matchMods) break; // first fit is fine
+      }
+      if (best) {
+        queue.splice(queue.indexOf(best.sid), 1);
+        queue.splice(queue.indexOf(a.sid), 1);
+        makeMatch(a, best, false, { bestOf: a.queueMode === "normal" ? 1 : 3, common: bestCommon, modsOnly: !!(a.matchMods || best.matchMods) });
+        found = true;
+      }
+    }
   }
   broadcastQueueCount();
 }
@@ -766,6 +800,9 @@ async function handle(c, msg) {
     case "queue":
       leaveRoom(c);
       closeHostedRoom(c);
+      c.queueMode = msg.mode === "normal" ? "normal" : "bo3";
+      c.matchMods = msg.matchMods === true;
+      c.mods = Array.isArray(msg.mods) ? msg.mods.slice(0, 300).map((m) => String(m).toLowerCase().slice(0, 60)).filter((m) => m) : [];
       if (!queue.includes(c.sid)) queue.push(c.sid);
       tryMatch();
       break;
@@ -1081,6 +1118,31 @@ const server = http.createServer((req, res) => {
     j.touched = Date.now();
     res.writeHead(200, { "Content-Type": "application/zip", "Content-Length": j.size, "Content-Disposition": 'attachment; filename="mod.zip"' });
     fs.createReadStream(j.file).pipe(res);
+    return;
+  }
+
+  // iPhone: the game cant open shortcuts:// links itself, so it opens this page and the page opens the Shortcut
+  if (req.method === "GET" && req.url.startsWith("/sc")) {
+    const job = new URL(req.url, "http://x").searchParams.get("job") || "";
+    if (!/^[A-Za-z0-9_.-]{1,140}$/.test(job)) {
+      res.writeHead(400);
+      return res.end("bad job");
+    }
+    const host = String(req.headers.host || "");
+    const proto = req.headers["x-forwarded-proto"] || (host.startsWith("localhost") || host.startsWith("127.") ? "http" : "https");
+    const file = `${proto}://${host}/modfile?job=${encodeURIComponent(job)}`;
+    const sc = "shortcuts://run-shortcut?name=" + encodeURIComponent("FNF Online Install") + "&input=text&text=" + encodeURIComponent(file);
+    const esc = sc.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="0;url=${esc}"><title>FNF Online install</title>
+<style>body{font-family:-apple-system,sans-serif;background:#1b1b2f;color:#fff;text-align:center;padding:40px 20px}
+a{display:inline-block;margin-top:24px;padding:18px 28px;background:#7c5cff;color:#fff;border-radius:14px;text-decoration:none;font-size:22px;font-weight:700}
+p{color:#bbb;font-size:17px}</style></head><body>
+<h2>Installing the mod...</h2><p>If Shortcuts didn't open, tap the button. Tap "Open" if iPhone asks.</p>
+<a href="${esc}">RUN THE SHORTCUT</a>
+<p>No Shortcut yet? <a style="background:#333;font-size:16px;padding:10px 16px" href="https://www.icloud.com/shortcuts/cdbeb3286fbb4c83a82fb8dcd0f135d2">Get it here</a></p>
+<script>location.href=${JSON.stringify(sc)};</script></body></html>`);
     return;
   }
 
