@@ -15,7 +15,7 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 18;
+const PROTOCOL = 20;
 const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
@@ -919,6 +919,39 @@ function opponentOf(c) {
 function leaveQueue(c) {
   queue = queue.filter((id) => id !== c.sid);
   partyQueue = partyQueue.filter((id) => id !== c.sid);
+  leaveLobby(c);
+}
+
+// ---------- private room lobbies: up to 3 people join the host, the host presses START
+// 1 joined = normal 1v1, 2 joined = 3 player party, 3 joined = 4 player party
+function lobbyMembers(code) {
+  const entry = privateRooms.get(code);
+  if (!entry) return [];
+  entry.members = (entry.members || []).filter((sid) => {
+    const m = sessions.get(sid);
+    return m && m.inLobby === code && !m.room;
+  });
+  return entry.members.map((sid) => sessions.get(sid));
+}
+
+function sendLobby(code) {
+  const entry = privateRooms.get(code);
+  if (!entry) return;
+  const host = findSessionByName(entry.name);
+  const members = lobbyMembers(code);
+  const players = [entry.name, ...members.map((m) => m.name)];
+  if (host && host.hostCode === code) send(host, { t: "lobby", code, host: entry.name, players, you: "host" });
+  for (const m of members) send(m, { t: "lobby", code, host: entry.name, players, you: "member" });
+}
+
+function leaveLobby(c) {
+  if (!c.inLobby) return;
+  const code = c.inLobby;
+  c.inLobby = null;
+  const entry = privateRooms.get(code);
+  if (!entry) return;
+  entry.members = (entry.members || []).filter((sid) => sid !== c.sid);
+  sendLobby(code);
 }
 
 // ---------- 3-4 player parties
@@ -950,7 +983,7 @@ function partyActive(room) {
   return room.slots.filter((sid) => !room.gone.has(sid) && sessions.has(sid));
 }
 
-function makeParty(players) {
+function makeParty(players, opts = {}) {
   const roomId = "p" + newId();
   const song = SONGS[Math.floor(Math.random() * SONGS.length)];
   const slots = players.map((p) => p.sid);
@@ -964,6 +997,7 @@ function makeParty(players) {
     b: slots[1],
     song,
     ranked: false,
+    private: !!opts.private,
     bestOf: 1,
     wins: {},
     round: 1,
@@ -999,12 +1033,12 @@ function makeParty(players) {
           profiles,
           me: profiles[i],
           opp: null,
-          private: false,
+          private: !!opts.private,
           ranked: false,
           bestOf: 1,
           common: [],
           modsOnly: false,
-          rules: {},
+          rules: opts.rules || {},
         });
       });
     });
@@ -1323,7 +1357,12 @@ const HOST_TIMEOUT_MS = 10 * 60 * 1000; // hosts waiting for a friend stay longe
 
 function closeHostedRoom(c) {
   if (c.hostCode) {
-    privateRooms.delete(c.hostCode);
+    const code = c.hostCode;
+    for (const m of lobbyMembers(code)) {
+      m.inLobby = null;
+      send(m, { t: "lobby_closed", msg: c.name + " closed the room" });
+    }
+    privateRooms.delete(code);
     c.hostCode = null;
   }
 }
@@ -1404,6 +1443,16 @@ async function handle(c, msg) {
       send(c, { t: "room_created", code });
       break;
     }
+    case "join_friend": {
+      // join a friends private room from the friends list (no code needed)
+      const key = String(msg.name || "").toLowerCase();
+      const target = findSessionByName(key);
+      if (!(await getFriends(c.name.toLowerCase())).includes(key)) return send(c, { t: "error", code: "room", msg: "u can only join friends" });
+      if (!target || !target.hostCode) return send(c, { t: "error", code: "room", msg: displayName(key) + " isnt in a private room rn" });
+      if ((await getStats(target.name)).noJoin) return send(c, { t: "error", code: "room", msg: target.name + " turned off joins, ask for the code" });
+      msg.code = target.hostCode;
+      // falls into join_room
+    }
     case "join_room": {
       if (serverConfig.maintenance && !isOwnerName(c.name)) return send(c, { t: "error", code: "room", msg: "Server under maintenance, be back soon!" });
       const code = String(msg.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -1417,11 +1466,31 @@ async function handle(c, msg) {
       const host = findSessionByName(entry.name);
       if (!host || host.hostCode !== code || host.room)
         return send(c, { t: "error", code: "room", msg: entry.name + " isnt in the room rn.\ntell them to keep FNF open on the room screen" });
+      if (c.inLobby === code) return sendLobby(code);
+      if (lobbyMembers(code).length >= 3) return send(c, { t: "error", code: "room", msg: "room " + code + " is full (4 players max)" });
       leaveQueue(c);
       leaveRoom(c);
       closeHostedRoom(c);
-      closeHostedRoom(host);
-      makeMatch(host, c, true, { rules: entry.rules });
+      entry.members = entry.members || [];
+      entry.members.push(c.sid);
+      c.inLobby = code;
+      console.log(`${c.name} joined room ${code}`);
+      sendLobby(code);
+      break;
+    }
+    case "start_room": {
+      const code = c.hostCode;
+      const entry = code ? privateRooms.get(code) : null;
+      if (!entry) return send(c, { t: "error", code: "room", msg: "ur room is gone, make a new one" });
+      const members = lobbyMembers(code);
+      if (members.length === 0) return send(c, { t: "friend_msg", msg: "nobody joined yet!" });
+      const rules = entry.rules;
+      for (const m of members) m.inLobby = null;
+      entry.members = [];
+      privateRooms.delete(code);
+      c.hostCode = null;
+      if (members.length === 1) makeMatch(c, members[0], true, { rules });
+      else makeParty([c, ...members], { private: true, rules });
       break;
     }
     // ---------- owner tools (server checks the account, the mod alone cant do anything)
@@ -1797,15 +1866,16 @@ async function handle(c, msg) {
       const st = await getStats(c.name);
       const acct = await getAccount(c.name.toLowerCase());
       const left = acct && acct.renamedAt && !isOwnerName(c.name) ? Math.max(0, acct.renamedAt + NAME_COOLDOWN - Date.now()) : 0;
-      send(c, { t: "profile", p: publicStats(c.name, st), noFR: !!st.noFR, nameLeft: left, pfps: PFPS });
+      send(c, { t: "profile", p: publicStats(c.name, st), noFR: !!st.noFR, noJoin: !!st.noJoin, nameLeft: left, pfps: PFPS });
       break;
     }
     case "profile_set": {
       const st = await getStats(c.name);
       if (typeof msg.pfp === "string" && PFPS.includes(msg.pfp)) st.pfp = msg.pfp;
       if (typeof msg.noFR === "boolean") st.noFR = msg.noFR;
+      if (typeof msg.noJoin === "boolean") st.noJoin = msg.noJoin;
       await saveStats(c.name, st);
-      send(c, { t: "profile", p: publicStats(c.name, st), noFR: !!st.noFR, nameLeft: -1, pfps: PFPS });
+      send(c, { t: "profile", p: publicStats(c.name, st), noFR: !!st.noFR, noJoin: !!st.noJoin, nameLeft: -1, pfps: PFPS });
       break;
     }
     case "change_name": {
