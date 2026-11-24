@@ -15,7 +15,7 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 21;
+const PROTOCOL = 22;
 const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
@@ -199,13 +199,49 @@ function badgeOf(name) {
 }
 
 // server settings the owner changes in game (maintenance, news popup, blocked mods)
-let serverConfig = { maintenance: false, news: null, blockedMods: [] };
+let serverConfig = { maintenance: false, news: null, blockedMods: [], blockedWords: [] };
+
+// ---------- word filter: blocked words become *** (also catches l33t, sp a c e s and looong letters)
+const LEET = { a: "[a4@]", e: "[e3]", i: "[i1!l|]", o: "[o0]", s: "[s5$]", t: "[t7+]", g: "[g9]", b: "[b8]", l: "[l1|i]" };
+let wordRegexes = [];
+function escapeRe(x) {
+  return x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function buildWordFilter() {
+  wordRegexes = (serverConfig.blockedWords || []).map((w) => {
+    const letters = [...w.toLowerCase()].map((ch) => (LEET[ch] || escapeRe(ch)) + "+");
+    return new RegExp(letters.join("[\\W_]*"), "gi");
+  });
+}
+function filterText(t) {
+  if (!t) return t;
+  for (const re of wordRegexes) t = t.replace(re, (m) => "*".repeat(m.length));
+  return t;
+}
+function hasBlockedWord(t) {
+  return !!t && wordRegexes.some((re) => {
+    re.lastIndex = 0;
+    const hit = re.test(t);
+    re.lastIndex = 0;
+    return hit;
+  });
+}
+
+// ---------- timeouts: cant play or chat for a while (still logged in)
+async function timeoutMsg(c) {
+  if (!c || isOwnerName(c.name)) return null;
+  const to = await getKV("timeouts", c.name.toLowerCase());
+  if (!to || !to.until || Date.now() >= to.until) return null;
+  return "ur timed out for " + timeLeft(to.until) + (to.reason ? " (" + to.reason + ")" : "");
+}
 async function loadConfig() {
   try {
     if (DB_URL && DB_TOKEN) {
       const v = await db(["GET", "config"]);
       if (v) serverConfig = Object.assign(serverConfig, JSON.parse(v));
     }
+    if (!Array.isArray(serverConfig.blockedWords)) serverConfig.blockedWords = [];
+    buildWordFilter();
     badgeCache = await getAllKV("badges");
   } catch (e) {
     console.log("config load failed:", e.message);
@@ -342,8 +378,21 @@ function publicStats(name, st) {
     best: st.best,
     owner: isOwnerName(name),
     badge: badgeOf(name),
-    pfp: pfpOf(st),
+    pfp: rememberPfp(name, st),
   };
+}
+
+// profile pictures we already know (friends list / lobby without loading everyones stats)
+const pfpCache = {};
+function rememberPfp(name, st) {
+  const p = pfpOf(st);
+  pfpCache[String(name).toLowerCase()] = p;
+  return p;
+}
+async function pfpFor(key) {
+  key = String(key).toLowerCase();
+  if (pfpCache[key]) return pfpCache[key];
+  return rememberPfp(key, await getStats(key));
 }
 
 // profile pictures (character icons from the base game)
@@ -359,6 +408,7 @@ const NAME_COOLDOWN = 30 * 24 * 60 * 60 * 1000; // change ur name once a month
 async function renameAccount(oldKey, newName) {
   const newKey = newName.toLowerCase();
   if (!validName(newName)) return "bad name (3-16, no spaces)";
+  if (hasBlockedWord(newName)) return "that name isnt allowed";
   if (newKey !== oldKey && (allAccounts.has(newKey) || (await getAccount(newKey)))) return newName + " is taken";
   const acct = await getAccount(oldKey);
   if (!acct) return "no account called " + oldKey;
@@ -549,7 +599,7 @@ async function setRequest(to, from, add) {
 
 async function sendRequests(c) {
   const list = [];
-  for (const k of await getRequests(c.name)) list.push({ name: displayName(k), status: statusOf(findSessionByName(k)), owner: isOwnerName(k) });
+  for (const k of await getRequests(c.name)) list.push({ name: displayName(k), status: statusOf(findSessionByName(k)), owner: isOwnerName(k), pfp: await pfpFor(k) });
   list.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
   send(c, { t: "friend_requests", list });
 }
@@ -566,7 +616,7 @@ async function sendFriends(c) {
   const unread = await getUnread(c.name);
   for (const k of await getFriends(c.name)) {
     const s = findSessionByName(k);
-    list.push({ name: displayName(k), status: statusOf(s), owner: isOwnerName(k), badge: badgeOf(k), unread: unread[k] || 0 });
+    list.push({ name: displayName(k), status: statusOf(s), owner: isOwnerName(k), badge: badgeOf(k), unread: unread[k] || 0, pfp: await pfpFor(k) });
   }
   // online first, then by name
   list.sort((a, b) => (a.status === "offline") - (b.status === "offline") || a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
@@ -688,6 +738,7 @@ async function onAuth(body, ip) {
   const name = body.name;
   const password = body.password;
   if (!validName(name)) return { ok: false, error: "name must be 3-16 characters, no spaces" };
+  if (hasBlockedWord(name) && !(await getAccount(name.toLowerCase()))) return { ok: false, error: "that name isnt allowed, pick another one" };
   if (!validPassword(password)) return { ok: false, error: "password must be 6-64 characters, no spaces" };
   if (tooMany("ip:" + ip, 20, 60000)) return { ok: false, error: "too many tries, wait a minute" };
 
@@ -945,8 +996,9 @@ function sendLobby(code) {
   const host = findSessionByName(entry.name);
   const members = lobbyMembers(code);
   const players = [entry.name, ...members.map((m) => m.name)];
-  if (host && host.hostCode === code) send(host, { t: "lobby", code, host: entry.name, players, you: "host" });
-  for (const m of members) send(m, { t: "lobby", code, host: entry.name, players, you: "member" });
+  const pfps = players.map((n) => pfpCache[n.toLowerCase()] || "default1");
+  if (host && host.hostCode === code) send(host, { t: "lobby", code, host: entry.name, players, pfps, you: "host" });
+  for (const m of members) send(m, { t: "lobby", code, host: entry.name, players, pfps, you: "member" });
 }
 
 function leaveLobby(c) {
@@ -1403,8 +1455,11 @@ function cleanName(n) {
 async function handle(c, msg) {
   if (!msg || typeof msg !== "object") return;
   switch (msg.t) {
-    case "queue":
+    case "queue": {
       if (serverConfig.maintenance && !isOwnerName(c.name)) return send(c, { t: "error", code: "maint", msg: "Server under maintenance, be back soon!" });
+      const qto = await timeoutMsg(c);
+      if (qto) return send(c, { t: "error", code: "maint", msg: qto });
+    }
       leaveRoom(c);
       closeHostedRoom(c);
       if (msg.party === true) {
@@ -1427,6 +1482,8 @@ async function handle(c, msg) {
       break;
     case "create_room": {
       if (serverConfig.maintenance && !isOwnerName(c.name)) return send(c, { t: "error", code: "room", msg: "Server under maintenance, be back soon!" });
+      const cto = await timeoutMsg(c);
+      if (cto) return send(c, { t: "error", code: "room", msg: cto });
       leaveQueue(c);
       leaveRoom(c);
       // reconnecting host asks for the same code back
@@ -1459,6 +1516,10 @@ async function handle(c, msg) {
       // falls into join_room
     }
     case "join_room": {
+      {
+        const jto = await timeoutMsg(c);
+        if (jto) return send(c, { t: "error", code: "room", msg: jto });
+      }
       if (serverConfig.maintenance && !isOwnerName(c.name)) return send(c, { t: "error", code: "room", msg: "Server under maintenance, be back soon!" });
       const code = String(msg.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
       const entry = privateRooms.get(code);
@@ -1480,6 +1541,8 @@ async function handle(c, msg) {
       entry.members.push(c.sid);
       c.inLobby = code;
       console.log(`${c.name} joined room ${code}`);
+      await pfpFor(c.name);
+      await pfpFor(entry.name);
       sendLobby(code);
       break;
     }
@@ -1661,6 +1724,12 @@ async function handle(c, msg) {
         if (k && !serverConfig.blockedMods.includes(k)) serverConfig.blockedMods.push(k);
       }
       if (typeof msg.unblockMod === "string") serverConfig.blockedMods = serverConfig.blockedMods.filter((m) => m !== msg.unblockMod);
+      if (typeof msg.blockWord === "string") {
+        const w = msg.blockWord.toLowerCase().replace(/\s+/g, "").slice(0, 30);
+        if (w.length >= 2 && !serverConfig.blockedWords.includes(w)) serverConfig.blockedWords.push(w);
+      }
+      if (typeof msg.unblockWord === "string") serverConfig.blockedWords = serverConfig.blockedWords.filter((x) => x !== msg.unblockWord);
+      buildWordFilter();
       await saveConfig();
       send(c, { t: "admin_settings", settings: serverConfig });
       break;
@@ -1673,6 +1742,33 @@ async function handle(c, msg) {
       if (msg.off === true) await setKV("mutes", key, null);
       else await setKV("mutes", key, { until: mins ? Date.now() + mins * 60000 : 0 });
       send(c, { t: "admin_done", msg: msg.off === true ? "unmuted " + displayName(key) : "muted " + displayName(key) + (mins ? " for " + timeLeft(Date.now() + mins * 60000) : " forever") });
+      break;
+    }
+    case "admin_timeout": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      const key = String(msg.name || "").toLowerCase();
+      if (msg.off === true) {
+        await setKV("timeouts", key, null);
+        send(c, { t: "admin_done", msg: "removed the timeout of " + displayName(key) });
+        const s = findSessionByName(key);
+        if (s) send(s, { t: "friend_msg", msg: "ur timeout is over, u can play again" });
+        break;
+      }
+      const mins = Math.max(1, Number(msg.mins) || 10);
+      const reason = String(msg.reason || "").slice(0, 80);
+      const until = Date.now() + mins * 60000;
+      await setKV("timeouts", key, { until, reason });
+      // get them out of whatever they were doing (they stay logged in)
+      const s = findSessionByName(key);
+      if (s) {
+        const wasInRoom = !!s.room;
+        leaveQueue(s);
+        leaveRoom(s);
+        closeHostedRoom(s);
+        send(s, { t: "timed_out", msg: "ur timed out for " + timeLeft(until) + (reason ? " (" + reason + ")" : ""), wasInRoom });
+      }
+      console.log(`owner timed out ${key} for ${mins} min`);
+      send(c, { t: "admin_done", msg: "timed out " + displayName(key) + " for " + timeLeft(until) });
       break;
     }
     case "admin_badge": {
@@ -1751,6 +1847,14 @@ async function handle(c, msg) {
           created: acct.created || null,
           devices: (acct.tokens || [acct.tokenHash]).filter((x) => x).length,
           banned: await isBanned(key),
+          muted: await (async () => {
+            const m = await getKV("mutes", key);
+            return m && (!m.until || Date.now() < m.until) ? (m.until ? timeLeft(m.until) : "forever") : null;
+          })(),
+          timedOut: await (async () => {
+            const t = await getKV("timeouts", key);
+            return t && t.until && Date.now() < t.until ? timeLeft(t.until) : null;
+          })(),
           owner: isOwnerName(key),
           friends,
           stats: publicStats(key, st),
@@ -1922,11 +2026,13 @@ async function handle(c, msg) {
       if (!text && !sticker) return;
       const mute = await getKV("mutes", c.name.toLowerCase());
       if (mute && (!mute.until || Date.now() < mute.until)) return send(c, { t: "friend_msg", msg: "ur muted" + (mute.until ? " for " + timeLeft(mute.until) : "") });
+      const gto = await timeoutMsg(c);
+      if (gto) return send(c, { t: "friend_msg", msg: gto });
       if (Date.now() - (c.lastG || 0) < 2000) return send(c, { t: "friend_msg", msg: "slow down lol (2 sec)" });
       c.lastG = Date.now();
       await loadGlobalChat();
       const st = await getStats(c.name);
-      const m = { from: c.name, to: "", text, sticker, at: Date.now(), badge: badgeOf(c.name), owner: isOwnerName(c.name), pfp: pfpOf(st) };
+      const m = { from: c.name, to: "", text: filterText(text), sticker, at: Date.now(), badge: badgeOf(c.name), owner: isOwnerName(c.name), pfp: pfpOf(st) };
       await addGlobalChat(m);
       for (const s of sessions.values()) if (s.inGlobal) send(s, { t: "gchat_msg", msg: m });
       break;
@@ -2026,10 +2132,12 @@ async function handle(c, msg) {
       if (!text && !sticker) return;
       const mute = await getKV("mutes", c.name.toLowerCase());
       if (mute && (!mute.until || Date.now() < mute.until)) return send(c, { t: "friend_msg", msg: "ur muted" + (mute.until ? " for " + timeLeft(mute.until) : "") });
+      const toMsg = await timeoutMsg(c);
+      if (toMsg) return send(c, { t: "friend_msg", msg: toMsg });
       const last = c.lastChat || 0;
       if (Date.now() - last < 600) return send(c, { t: "friend_msg", msg: "slow down lol" });
       c.lastChat = Date.now();
-      const m = { from: c.name, to: displayName(toKey), text, sticker, at: Date.now() };
+      const m = { from: c.name, to: displayName(toKey), text: filterText(text), sticker, at: Date.now() };
       await chatStore(c.name, toKey, m);
       send(c, { t: "chat_msg", msg: m });
       const target = findSessionByName(toKey);
