@@ -15,7 +15,7 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 20;
+const PROTOCOL = 21;
 const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
@@ -342,12 +342,17 @@ function publicStats(name, st) {
     best: st.best,
     owner: isOwnerName(name),
     badge: badgeOf(name),
-    pfp: PFPS.includes(st.pfp) ? st.pfp : "bf",
+    pfp: pfpOf(st),
   };
 }
 
 // profile pictures (character icons from the base game)
-const PFPS = ["bf", "gf", "dad", "spooky", "pico", "mom", "parents-christmas", "monster", "senpai-pixel", "spirit-pixel", "tankman", "darnell", "nene", "bf-pixel"];
+const PFPS = ["default1", "default2", "default3", "boyfriend", "girlfriend", "dad", "mom", "pico", "darnell", "nene", "tankman", "otis", "sky"];
+const OLD_PFPS = { bf: "boyfriend", gf: "girlfriend", dad: "dad", mom: "mom", pico: "pico", darnell: "darnell", nene: "nene", tankman: "tankman" };
+function pfpOf(st) {
+  const p = OLD_PFPS[st.pfp] || st.pfp;
+  return PFPS.includes(p) ? p : "default1";
+}
 const NAME_COOLDOWN = 30 * 24 * 60 * 60 * 1000; // change ur name once a month
 
 // moves an account to a new name (rank, friends, badge). returns an error text or null
@@ -1921,7 +1926,7 @@ async function handle(c, msg) {
       c.lastG = Date.now();
       await loadGlobalChat();
       const st = await getStats(c.name);
-      const m = { from: c.name, to: "", text, sticker, at: Date.now(), badge: badgeOf(c.name), owner: isOwnerName(c.name), pfp: PFPS.includes(st.pfp) ? st.pfp : "bf" };
+      const m = { from: c.name, to: "", text, sticker, at: Date.now(), badge: badgeOf(c.name), owner: isOwnerName(c.name), pfp: pfpOf(st) };
       await addGlobalChat(m);
       for (const s of sessions.values()) if (s.inGlobal) send(s, { t: "gchat_msg", msg: m });
       break;
