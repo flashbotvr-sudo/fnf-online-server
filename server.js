@@ -15,7 +15,7 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 23;
+const PROTOCOL = 24;
 const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
@@ -396,7 +396,7 @@ async function pfpFor(key) {
 }
 
 // profile pictures (character icons from the base game)
-const PFPS = ["default1", "default2", "default3", "boyfriend", "girlfriend", "dad", "mom", "pico", "darnell", "nene", "tankman", "otis", "sky"];
+const PFPS = ["default1", "default2", "default3", "boyfriend", "girlfriend", "dad", "mom", "pico", "darnell", "nene", "tankman", "otis", "sky", "kids", "garcello", "hex", "whitty", "nonsense", "pink", "qt", "red"];
 const OLD_PFPS = { bf: "boyfriend", gf: "girlfriend", dad: "dad", mom: "mom", pico: "pico", darnell: "darnell", nene: "nene", tankman: "tankman" };
 function pfpOf(st) {
   const p = OLD_PFPS[st.pfp] || st.pfp;
