@@ -15,7 +15,7 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
 const PORT = Number(process.env.PORT || 7777);
-const PROTOCOL = 16;
+const PROTOCOL = 18;
 const SESSION_TIMEOUT_MS = 90000; // no poll for this long = player is gone (long so installing a big mod doesnt kick u)
 const SONGS = ["bopeebo", "fresh", "dadbattle"]; // songs matches can pick, change whenever
 
@@ -342,8 +342,97 @@ function publicStats(name, st) {
     best: st.best,
     owner: isOwnerName(name),
     badge: badgeOf(name),
+    pfp: PFPS.includes(st.pfp) ? st.pfp : "bf",
   };
 }
+
+// profile pictures (character icons from the base game)
+const PFPS = ["bf", "gf", "dad", "spooky", "pico", "mom", "parents-christmas", "monster", "senpai-pixel", "spirit-pixel", "tankman", "darnell", "nene", "bf-pixel"];
+const NAME_COOLDOWN = 30 * 24 * 60 * 60 * 1000; // change ur name once a month
+
+// moves an account to a new name (rank, friends, badge). returns an error text or null
+async function renameAccount(oldKey, newName) {
+  const newKey = newName.toLowerCase();
+  if (!validName(newName)) return "bad name (3-16, no spaces)";
+  if (newKey !== oldKey && (allAccounts.has(newKey) || (await getAccount(newKey)))) return newName + " is taken";
+  const acct = await getAccount(oldKey);
+  if (!acct) return "no account called " + oldKey;
+  acct.name = newName;
+  if (newKey === oldKey) {
+    // just changing CAPS
+    if (DB_URL && DB_TOKEN) await db(["SET", "acct:" + oldKey, JSON.stringify(acct)]);
+    else memoryAccounts.set(oldKey, acct);
+    allAccounts.set(oldKey, newName);
+    return null;
+  }
+  if (!(await createAccount(newKey, acct))) return "couldnt rename, try again";
+  const st = await getStats(oldKey);
+  await saveStats(newKey, st);
+  const friends = await getFriends(oldKey);
+  for (const f of friends) {
+    await setFriend(newKey, f, true);
+    await setFriend(f, oldKey, false);
+    await setFriend(f, newKey, true);
+  }
+  const badge = badgeOf(oldKey);
+  if (badge) {
+    await setKV("badges", newKey, badge);
+    badgeCache[newKey] = badge;
+  }
+  await deleteAccount(oldKey);
+  allAccounts.set(newKey, newName);
+  return null;
+}
+
+// global chat (everyone online)
+const globalChat = [];
+let globalLoaded = false;
+async function loadGlobalChat() {
+  if (globalLoaded) return;
+  globalLoaded = true;
+  if (!DB_URL || !DB_TOKEN) return;
+  try {
+    const list = (await db(["LRANGE", "gchat", "0", "-1"])) || [];
+    for (const x of list) {
+      try {
+        globalChat.push(JSON.parse(x));
+      } catch {}
+    }
+  } catch {}
+}
+async function addGlobalChat(m) {
+  globalChat.push(m);
+  while (globalChat.length > 60) globalChat.shift();
+  if (DB_URL && DB_TOKEN) {
+    await db(["RPUSH", "gchat", JSON.stringify(m)]).catch(() => {});
+    await db(["LTRIM", "gchat", "-60", "-1"]).catch(() => {});
+  }
+}
+
+function tellOwners(text) {
+  for (const s of sessions.values()) if (isOwnerName(s.name)) send(s, { t: "admin_done", msg: text });
+}
+
+// cheat check: too many 100% songs in a row = the owner gets told
+async function checkCheat(c, acc) {
+  const st = await getStats(c.name);
+  const list = Array.isArray(st.accs) ? st.accs : [];
+  list.push(Math.round((Number(acc) || 0) * 100) / 100);
+  while (list.length > 10) list.shift();
+  st.accs = list;
+  await saveStats(c.name, st);
+  const perfect = list.filter((a) => a >= 100).length;
+  if (perfect >= 4 && perfect >= list.length * 0.6) {
+    const key = c.name.toLowerCase();
+    const last = cheatAlerted.get(key) || 0;
+    if (Date.now() - last < 6 * 60 * 60 * 1000) return; // once every 6 hours per player
+    cheatAlerted.set(key, Date.now());
+    await addReport({ from: "CHEAT ALERT", name: c.name, reason: "got 100% in " + perfect + " of their last " + list.length + " songs", at: Date.now() });
+    tellOwners("CHEAT ALERT: " + c.name + " got 100% in " + perfect + " of " + list.length + " songs");
+    console.log("cheat alert: " + c.name);
+  }
+}
+const cheatAlerted = new Map();
 
 // winner gets points, loser loses them (elo, 32 max per match)
 async function applyRanked(winName, loseName) {
@@ -823,17 +912,202 @@ function send(c, msg) {
 
 function opponentOf(c) {
   const room = rooms.get(c.room);
-  if (!room) return null;
+  if (!room || room.party) return null;
   return sessions.get(room.a === c.sid ? room.b : room.a) || null;
 }
 
 function leaveQueue(c) {
   queue = queue.filter((id) => id !== c.sid);
+  partyQueue = partyQueue.filter((id) => id !== c.sid);
+}
+
+// ---------- 3-4 player parties
+// 4 people in the party queue = match. 3 people who waited 25s = match too
+let partyQueue = [];
+const PARTY_WAIT_3 = 25000;
+
+function tryParty() {
+  partyQueue = partyQueue.filter((id) => sessions.has(id) && !sessions.get(id).room);
+  let made = true;
+  while (made) {
+    made = false;
+    if (partyQueue.length >= 4) {
+      makeParty(partyQueue.splice(0, 4).map((id) => sessions.get(id)));
+      made = true;
+    } else if (partyQueue.length === 3) {
+      const oldest = Math.min(...partyQueue.map((id) => sessions.get(id).partyAt || Date.now()));
+      if (Date.now() - oldest >= PARTY_WAIT_3) {
+        makeParty(partyQueue.splice(0, 3).map((id) => sessions.get(id)));
+        made = true;
+      }
+    }
+  }
+  for (const id of partyQueue) send(sessions.get(id), { t: "queued", count: partyQueue.length, party: true });
+}
+setInterval(tryParty, 2000);
+
+function partyActive(room) {
+  return room.slots.filter((sid) => !room.gone.has(sid) && sessions.has(sid));
+}
+
+function makeParty(players) {
+  const roomId = "p" + newId();
+  const song = SONGS[Math.floor(Math.random() * SONGS.length)];
+  const slots = players.map((p) => p.sid);
+  const room = {
+    id: roomId,
+    party: true,
+    slots,
+    names: players.map((p) => p.name),
+    gone: new Set(),
+    a: slots[0],
+    b: slots[1],
+    song,
+    ranked: false,
+    bestOf: 1,
+    wins: {},
+    round: 1,
+    reports: {},
+    over: false,
+    inSong: false,
+    timer: null,
+    scores: {},
+    spectators: new Set(),
+  };
+  for (const sid of slots) room.wins[sid] = 0;
+  rooms.set(roomId, room);
+  for (const p of players) {
+    p.room = roomId;
+    p.spectating = null;
+  }
+  console.log(`party: ${room.names.join(", ")}`);
+  todayStats().matches++;
+  Promise.all(players.map((p) => getStats(p.name)))
+    .catch(() => players.map(() => newStats()))
+    .then((sts) => {
+      const profiles = players.map((p, i) => publicStats(p.name, sts[i]));
+      players.forEach((p, i) => {
+        send(p, {
+          t: "match",
+          party: true,
+          room: roomId,
+          song,
+          slot: i,
+          side: i === 0 ? "bf" : "dad",
+          opponent: i === 0 ? "the others" : room.names[0],
+          players: room.names,
+          profiles,
+          me: profiles[i],
+          opp: null,
+          private: false,
+          ranked: false,
+          bestOf: 1,
+          common: [],
+          modsOnly: false,
+          rules: {},
+        });
+      });
+    });
+}
+
+function partyLeave(c, room) {
+  room.gone.add(c.sid);
+  c.room = null;
+  const slot = room.slots.indexOf(c.sid);
+  const left = partyActive(room);
+  if (left.length <= 1) {
+    rooms.delete(room.id);
+    if (room.timer) clearTimeout(room.timer);
+    for (const sid of left) {
+      const p = sessions.get(sid);
+      p.room = null;
+      send(p, { t: "opponent_left" });
+    }
+    for (const sid of room.spectators) {
+      const sp = sessions.get(sid);
+      if (sp) {
+        sp.spectating = null;
+        send(sp, { t: "spec_end", msg: "the party ended" });
+      }
+    }
+    return;
+  }
+  for (const sid of left) send(sessions.get(sid), { t: "party_left", slot, name: c.name });
+  // everyone else already finished the song: decide it now
+  if (left.every((sid) => room.reports[sid])) decidePartyRound(room);
+}
+
+async function decidePartyRound(room) {
+  if (room.timer) clearTimeout(room.timer);
+  room.timer = null;
+  if (!rooms.has(room.id)) return;
+  room.inSong = false;
+  let best = -1;
+  let winner = null;
+  let tie = false;
+  for (const sid of room.slots) {
+    const r = room.reports[sid];
+    if (!r) continue;
+    if (r.score > best) {
+      best = r.score;
+      winner = sid;
+      tie = false;
+    } else if (r.score === best) tie = true;
+  }
+  if (tie) winner = null;
+  if (winner) room.wins[winner]++;
+  const roundNo = room.round++;
+  const need = room.bestOf === 1 ? 1 : 2;
+  let over = room.slots.some((sid) => room.wins[sid] >= need) || roundNo >= (room.bestOf === 1 ? 1 : 5);
+  let seriesWinner = null;
+  if (over) {
+    room.over = true;
+    let bw = -1;
+    let btie = false;
+    for (const sid of room.slots) {
+      if (room.wins[sid] > bw) {
+        bw = room.wins[sid];
+        seriesWinner = sid;
+        btie = false;
+      } else if (room.wins[sid] === bw) btie = true;
+    }
+    if (btie) seriesWinner = null;
+  }
+  const standings = room.slots.map((sid, i) => ({
+    name: room.names[i],
+    score: room.reports[sid] ? room.reports[sid].score : null,
+    misses: room.reports[sid] ? room.reports[sid].misses : null,
+    wins: room.wins[sid],
+    left: room.gone.has(sid),
+  }));
+  room.reports = {};
+  for (const sid of partyActive(room)) {
+    const otherWins = Math.max(0, ...room.slots.filter((x) => x !== sid).map((x) => room.wins[x]));
+    send(sessions.get(sid), {
+      t: "round",
+      party: true,
+      round: roundNo,
+      won: winner === null ? null : winner === sid,
+      me: room.wins[sid],
+      them: otherWins,
+      over,
+      seriesWon: over ? (seriesWinner === null ? null : seriesWinner === sid) : null,
+      standings,
+      ranked: false,
+      bestOf: room.bestOf,
+    });
+  }
+  const wins = {};
+  room.slots.forEach((sid, i) => (wins[room.names[i]] = room.wins[sid]));
+  for (const sid of room.spectators) {
+    send(sessions.get(sid), { t: "spec_round", round: roundNo, winner: winner ? room.names[room.slots.indexOf(winner)] : null, wins, over });
+  }
 }
 
 function leaveRoom(c) {
   if (!c.room) return;
   const room = rooms.get(c.room);
+  if (room && room.party) return partyLeave(c, room);
   const opp = opponentOf(c);
   rooms.delete(c.room);
   c.room = null;
@@ -869,6 +1143,11 @@ async function onResult(c, msg) {
   if (!room) return;
   if (room.over) resetSeries(room);
   room.reports[c.sid] = { score: Math.max(0, Number(msg.score) || 0), misses: Math.max(0, Number(msg.misses) || 0) };
+  if (room.party) {
+    if (partyActive(room).every((sid) => room.reports[sid])) decidePartyRound(room);
+    else if (!room.timer) room.timer = setTimeout(() => decidePartyRound(room), 60000);
+    return;
+  }
   if (room.reports[room.a] && room.reports[room.b]) decideRound(room);
   else if (!room.timer) room.timer = setTimeout(() => decideRound(room), 60000); // the other one never finished
 }
@@ -876,6 +1155,12 @@ async function onResult(c, msg) {
 // rematch after a finished match = brand new best of 3
 function resetSeries(room) {
   room.over = false;
+  if (room.party) {
+    for (const sid of room.slots) room.wins[sid] = 0;
+    room.round = 1;
+    room.reports = {};
+    return;
+  }
   room.wins[room.a] = 0;
   room.wins[room.b] = 0;
   room.round = 1;
@@ -979,10 +1264,16 @@ function makeMatch(a, b, isPrivate, opts) {
       const pa = publicStats(a.name, sa);
       const pb = publicStats(b.name, sb);
       // a plays as bf (picks the song), b as dad
-      const extra = { bestOf, common: opts.common || [], modsOnly: !!opts.modsOnly };
+      const extra = { bestOf, common: opts.common || [], modsOnly: !!opts.modsOnly, rules: opts.rules || {} };
       send(a, { t: "match", room: roomId, song, side: "bf", opponent: b.name, private: !!isPrivate, ranked: room.ranked, me: pa, opp: pb, ...extra });
       send(b, { t: "match", room: roomId, song, side: "dad", opponent: a.name, private: !!isPrivate, ranked: room.ranked, me: pb, opp: pa, ...extra });
     });
+}
+
+// private room modifiers
+function cleanRules(r) {
+  r = r && typeof r === "object" ? r : {};
+  return { sudden: r.sudden === true, fast: r.fast === true, sick: r.sick === true };
 }
 
 function commonMods(a, b) {
@@ -1072,6 +1363,13 @@ async function handle(c, msg) {
       if (serverConfig.maintenance && !isOwnerName(c.name)) return send(c, { t: "error", code: "maint", msg: "Server under maintenance, be back soon!" });
       leaveRoom(c);
       closeHostedRoom(c);
+      if (msg.party === true) {
+        leaveQueue(c);
+        c.partyAt = Date.now();
+        partyQueue.push(c.sid);
+        tryParty();
+        break;
+      }
       c.queueMode = msg.mode === "normal" ? "normal" : "bo3";
       c.matchMods = msg.matchMods === true;
       c.mods = Array.isArray(msg.mods) ? msg.mods.slice(0, 300).map((m) => String(m).toLowerCase().slice(0, 60)).filter((m) => m) : [];
@@ -1093,13 +1391,14 @@ async function handle(c, msg) {
       if (old && old.name.toLowerCase() === c.name.toLowerCase()) {
         if (c.hostCode && c.hostCode !== want) closeHostedRoom(c);
         old.made = Date.now();
+        if (msg.rules) old.rules = cleanRules(msg.rules);
         c.hostCode = want;
         return send(c, { t: "room_created", code: want });
       }
       closeHostedRoom(c);
       const code = newRoomCode();
       if (!code) return send(c, { t: "error", code: "room", msg: "couldnt make a room, try again" });
-      privateRooms.set(code, { name: c.name, made: Date.now() });
+      privateRooms.set(code, { name: c.name, made: Date.now(), rules: cleanRules(msg.rules) });
       c.hostCode = code;
       console.log(`room ${code} made by ${c.name}`);
       send(c, { t: "room_created", code });
@@ -1122,7 +1421,7 @@ async function handle(c, msg) {
       leaveRoom(c);
       closeHostedRoom(c);
       closeHostedRoom(host);
-      makeMatch(host, c, true);
+      makeMatch(host, c, true, { rules: entry.rules });
       break;
     }
     // ---------- owner tools (server checks the account, the mod alone cant do anything)
@@ -1200,6 +1499,23 @@ async function handle(c, msg) {
       if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
       const list = [];
       for (const r of rooms.values()) {
+        if (r.party) {
+          const act = partyActive(r);
+          list.push({
+            a: act.map((sid) => sessions.get(sid).name).join(", "),
+            b: "(" + act.length + " player party)",
+            song: r.songName || "picking...",
+            sa: Math.max(0, ...act.map((sid) => (r.scores && r.scores[sid]) || 0)),
+            sb: 0,
+            wa: 0,
+            wb: 0,
+            round: r.round,
+            ranked: false,
+            bestOf: r.bestOf,
+            watchers: r.spectators.size,
+          });
+          continue;
+        }
         const A = sessions.get(r.a);
         const B = sessions.get(r.b);
         if (!A || !B) continue;
@@ -1309,29 +1625,8 @@ async function handle(c, msg) {
       if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
       const oldKey = String(msg.name || "").toLowerCase();
       const newName = String(msg.newName || "");
-      const newKey = newName.toLowerCase();
-      if (!validName(newName)) return send(c, { t: "admin_done", msg: "bad new name (3-16, no spaces)" });
-      if (allAccounts.has(newKey) || (await getAccount(newKey))) return send(c, { t: "admin_done", msg: newName + " is taken" });
-      const acct = await getAccount(oldKey);
-      if (!acct) return send(c, { t: "admin_done", msg: "no account called " + msg.name });
-      acct.name = newName;
-      if (!(await createAccount(newKey, acct))) return send(c, { t: "admin_done", msg: "couldnt rename, try again" });
-      // move rank, friends, badge
-      const st = await getStats(oldKey);
-      await saveStats(newKey, st);
-      const friends = await getFriends(oldKey);
-      for (const f of friends) {
-        await setFriend(newKey, f, true);
-        await setFriend(f, oldKey, false);
-        await setFriend(f, newKey, true);
-      }
-      const badge = badgeOf(oldKey);
-      if (badge) {
-        await setKV("badges", newKey, badge);
-        badgeCache[newKey] = badge;
-      }
-      await deleteAccount(oldKey);
-      allAccounts.set(newKey, newName);
+      const err = await renameAccount(oldKey, newName);
+      if (err) return send(c, { t: "admin_done", msg: err });
       for (const s of sessions.values()) if (s.name.toLowerCase() === oldKey) kickSession(s, "ur account got renamed to " + newName + ", log in with that name");
       console.log(`owner renamed ${oldKey} to ${newName}`);
       send(c, { t: "admin_done", msg: "renamed to " + newName });
@@ -1439,9 +1734,8 @@ async function handle(c, msg) {
       const room = target ? rooms.get(target.room) : null;
       if (!room) return send(c, { t: "admin_done", msg: (msg.name || "they") + " isnt in a match" });
       room.over = true; // no rank change for this
-      const A = sessions.get(room.a);
-      const B = sessions.get(room.b);
-      for (const p of [A, B]) if (p) kickSession(p, "the owner ended ur match");
+      const who = room.party ? room.slots.map((sid) => sessions.get(sid)) : [sessions.get(room.a), sessions.get(room.b)];
+      for (const p of who) if (p) kickSession(p, "the owner ended ur match");
       send(c, { t: "admin_done", msg: "ended the match of " + target.name });
       break;
     }
@@ -1467,8 +1761,11 @@ async function handle(c, msg) {
           room.scores[c.sid] = Number(msg.data.score) || 0;
         }
       }
-      // gameplay stuff (ready, score, done) goes straight to the opponent
-      send(opponentOf(c), { t: "relay", data: msg.data });
+      // gameplay stuff (ready, score, done) goes straight to the opponent (party: to everyone else)
+      if (room && room.party) {
+        const slot = room.slots.indexOf(c.sid);
+        for (const sid of partyActive(room)) if (sid !== c.sid) send(sessions.get(sid), { t: "relay", data: msg.data, slot, from: c.name });
+      } else send(opponentOf(c), { t: "relay", data: msg.data });
       if (room && msg.data && typeof msg.data === "object") {
         const ty = msg.data.type;
         if (ty === "ready") {
@@ -1484,7 +1781,89 @@ async function handle(c, msg) {
     }
     case "result":
       await onResult(c, msg);
+      if (msg.acc != null) checkCheat(c, msg.acc).catch((e) => console.log("cheat check failed:", e.message));
       break;
+    case "cheat_flag": {
+      // the mod found a botplay file/mod on their pc
+      if (c.flagged) break;
+      c.flagged = true;
+      const what = String(msg.what || "").replace(/[\r\n]+/g, " ").slice(0, 120);
+      await addReport({ from: "CHEAT ALERT", name: c.name, reason: "botplay found: " + what, at: Date.now() });
+      tellOwners("CHEAT ALERT: " + c.name + " has botplay (" + what + ")");
+      break;
+    }
+    // ---------- profile
+    case "profile_get": {
+      const st = await getStats(c.name);
+      const acct = await getAccount(c.name.toLowerCase());
+      const left = acct && acct.renamedAt && !isOwnerName(c.name) ? Math.max(0, acct.renamedAt + NAME_COOLDOWN - Date.now()) : 0;
+      send(c, { t: "profile", p: publicStats(c.name, st), noFR: !!st.noFR, nameLeft: left, pfps: PFPS });
+      break;
+    }
+    case "profile_set": {
+      const st = await getStats(c.name);
+      if (typeof msg.pfp === "string" && PFPS.includes(msg.pfp)) st.pfp = msg.pfp;
+      if (typeof msg.noFR === "boolean") st.noFR = msg.noFR;
+      await saveStats(c.name, st);
+      send(c, { t: "profile", p: publicStats(c.name, st), noFR: !!st.noFR, nameLeft: -1, pfps: PFPS });
+      break;
+    }
+    case "change_name": {
+      const oldKey = c.name.toLowerCase();
+      const newName = String(msg.newName || "").trim();
+      const acct = await getAccount(oldKey);
+      if (!acct) return send(c, { t: "name_result", ok: false, msg: "log in again" });
+      if (acct.renamedAt && !isOwnerName(c.name) && Date.now() < acct.renamedAt + NAME_COOLDOWN)
+        return send(c, { t: "name_result", ok: false, msg: "u can change ur name again in " + timeLeft(acct.renamedAt + NAME_COOLDOWN) });
+      if (c.room) return send(c, { t: "name_result", ok: false, msg: "finish ur match first" });
+      const err = await renameAccount(oldKey, newName);
+      if (err) return send(c, { t: "name_result", ok: false, msg: err });
+      const fresh = await getAccount(newName.toLowerCase());
+      if (fresh) {
+        fresh.renamedAt = Date.now();
+        if (DB_URL && DB_TOKEN) await db(["SET", "acct:" + newName.toLowerCase(), JSON.stringify(fresh)]);
+        else memoryAccounts.set(newName.toLowerCase(), fresh);
+      }
+      console.log(`${oldKey} changed their name to ${newName}`);
+      send(c, { t: "name_result", ok: true, name: newName, msg: "ur name is " + newName + " now!" });
+      // the game reconnects with the new name (same login token)
+      closeHostedRoom(c);
+      leaveQueue(c);
+      c.endAfter = true;
+      break;
+    }
+    // ---------- global chat
+    case "gchat_join":
+      await loadGlobalChat();
+      c.inGlobal = true;
+      send(c, { t: "gchat_history", msgs: globalChat.slice(-40) });
+      break;
+    case "gchat_leave":
+      c.inGlobal = false;
+      break;
+    case "gchat_send": {
+      const text = String(msg.text || "").replace(/[\r\n]+/g, " ").slice(0, 150).trim();
+      const sticker = typeof msg.sticker === "string" && STICKER_RE.test(msg.sticker) && !msg.sticker.includes("..") ? msg.sticker : null;
+      if (!text && !sticker) return;
+      const mute = await getKV("mutes", c.name.toLowerCase());
+      if (mute && (!mute.until || Date.now() < mute.until)) return send(c, { t: "friend_msg", msg: "ur muted" + (mute.until ? " for " + timeLeft(mute.until) : "") });
+      if (Date.now() - (c.lastG || 0) < 2000) return send(c, { t: "friend_msg", msg: "slow down lol (2 sec)" });
+      c.lastG = Date.now();
+      await loadGlobalChat();
+      const st = await getStats(c.name);
+      const m = { from: c.name, to: "", text, sticker, at: Date.now(), badge: badgeOf(c.name), owner: isOwnerName(c.name), pfp: PFPS.includes(st.pfp) ? st.pfp : "bf" };
+      await addGlobalChat(m);
+      for (const s of sessions.values()) if (s.inGlobal) send(s, { t: "gchat_msg", msg: m });
+      break;
+    }
+    case "admin_gchat_clear": {
+      if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
+      globalChat.length = 0;
+      if (DB_URL && DB_TOKEN) await db(["DEL", "gchat"]).catch(() => {});
+      for (const s of sessions.values()) if (s.inGlobal) send(s, { t: "gchat_history", msgs: [] });
+      send(c, { t: "admin_done", msg: "global chat cleared" });
+      break;
+    }
     // ---------- friends
     case "friends_list":
       await sendFriends(c);
@@ -1509,6 +1888,7 @@ async function handle(c, msg) {
         }
         break;
       }
+      if ((await getStats(key)).noFR) return send(c, { t: "friend_msg", msg: displayName(key) + " turned off friend requests" });
       if ((await getRequests(key)).length >= 50) return send(c, { t: "friend_msg", msg: displayName(key) + " has too many requests rn" });
       await setRequest(key, c.name, true);
       send(c, { t: "friend_msg", msg: "friend request sent to " + displayName(key) + "!" });
@@ -1704,6 +2084,11 @@ async function onPoll(body) {
   for (const m of out) if (m && m.t !== "hello") await handle(c, m);
   if (!sessions.has(c.sid)) return { msgs: [] }; // said bye
 
+  if (c.endAfter) {
+    // changed their name: give them the reply, then they reconnect as the new name
+    sessions.delete(c.sid);
+    return { msgs: c.inbox.splice(0), now: Date.now() };
+  }
   return { sid: c.sid, msgs: c.inbox.splice(0), now: Date.now() };
 }
 
