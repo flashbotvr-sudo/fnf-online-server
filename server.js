@@ -210,7 +210,7 @@ function escapeRe(x) {
 function buildWordFilter() {
   wordRegexes = (serverConfig.blockedWords || []).map((w) => {
     const letters = [...w.toLowerCase()].map((ch) => (LEET[ch] || escapeRe(ch)) + "+");
-    return new RegExp(letters.join("[\\W_]*"), "gi");
+    return new RegExp(letters.join("[^\\p{L}\\p{N}]*"), "giu");
   });
 }
 function filterText(t) {
@@ -400,7 +400,225 @@ const PFPS = ["default1", "default2", "default3", "boyfriend", "girlfriend", "da
 const OLD_PFPS = { bf: "boyfriend", gf: "girlfriend", dad: "dad", mom: "mom", pico: "pico", darnell: "darnell", nene: "nene", tankman: "tankman" };
 function pfpOf(st) {
   const p = OLD_PFPS[st.pfp] || st.pfp;
-  return PFPS.includes(p) ? p : "default1";
+  return PFPS.includes(p) || isCustomPfp(p) ? p : "default1";
+}
+
+// ------------------------------------------------------------ custom profile pictures
+// st.pfp = "custom-<random id>", the picture itself is saved separately (base64) under that id
+// moving pictures are a png sheet of square frames, the id ends with "-a<frames>f<frames per second>"
+const MAX_PFP_BYTES = 1024 * 1024;
+const MAX_PFP_SIDE = 1500;
+const memoryPfps = new Map();
+const MAX_ANIM_BYTES = 5 * 1024 * 1024; // gif / webp before converting
+const FRAME_SIDE = 192; // must match the mod
+const SHEET_COLS = 5; // must match the mod
+const MAX_FRAMES = 20;
+const sheetSize = (n) => [Math.min(n, SHEET_COLS) * FRAME_SIDE, Math.ceil(n / SHEET_COLS) * FRAME_SIDE];
+
+// gif / animated webp -> sheet. keeps the same total length, picks frames evenly over time
+async function makeSheet(bytes, meta) {
+  const opts = { limitInputPixels: 4000 * 4000 };
+  const delays = Array.from({ length: meta.pages }, (_, i) => (meta.delay && meta.delay[i] > 10 ? meta.delay[i] : 100));
+  const total = delays.reduce((a, b) => a + b, 0);
+  for (const max of [MAX_FRAMES, 16, 12, 8]) {
+    const n = Math.min(max, meta.pages);
+    const frames = [];
+    let page = 0;
+    let end = delays[0];
+    for (let i = 0; i < n; i++) {
+      if (n === meta.pages) page = i;
+      else while (end <= (i * total) / n) end += delays[++page];
+      const input = await sharp(bytes, { ...opts, page })
+        .resize(FRAME_SIDE, FRAME_SIDE, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+        .ensureAlpha()
+        .png()
+        .toBuffer();
+      frames.push({ input, left: (i % SHEET_COLS) * FRAME_SIDE, top: Math.floor(i / SHEET_COLS) * FRAME_SIDE });
+    }
+    const [width, height] = sheetSize(n);
+    const canvas = () => sharp({ create: { width, height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } }).composite(frames);
+    let png = await canvas().png().toBuffer();
+    if (png.length > MAX_PFP_BYTES) png = await canvas().png({ palette: true }).toBuffer(); // fewer colors = smaller
+    if (png.length <= MAX_PFP_BYTES) return { png, frames: n, fps: Math.max(1, Math.min(30, Math.round((n * 1000) / total))) };
+  }
+  return null;
+}
+
+// every frame that can be shown gets checked on its own. returns null if all ok
+async function checkSheet(bytes, count) {
+  if (!OPENAI_KEY || !sharp) return "moving pictures arent set up on the server";
+  for (let i = 0; i < count; i += 4) {
+    const batch = [];
+    for (let k = i; k < Math.min(i + 4, count); k++) {
+      batch.push(
+        sharp(bytes)
+          .extract({ left: (k % SHEET_COLS) * FRAME_SIDE, top: Math.floor(k / SHEET_COLS) * FRAME_SIDE, width: FRAME_SIDE, height: FRAME_SIDE })
+          .png()
+          .toBuffer()
+          .then((frame) => checkPicture(frame.toString("base64"), "image/png"))
+      );
+    }
+    const refused = (await Promise.all(batch)).find((r) => r);
+    if (refused) return refused;
+  }
+  return null;
+}
+
+function isCustomPfp(id) {
+  return typeof id === "string" && /^custom-[a-f0-9]{24}(-a([2-9]|1\d|20)f([1-9]|[12]\d|30))?$/.test(id);
+}
+async function getPfpImage(id) {
+  if (!isCustomPfp(id)) return null;
+  if (!DB_URL || !DB_TOKEN) return memoryPfps.get(id) || null;
+  return await db(["GET", "pfpimg2:" + id]);
+}
+async function savePfpImage(id, data) {
+  if (!DB_URL || !DB_TOKEN) memoryPfps.set(id, data);
+  else await db(["SET", "pfpimg2:" + id, data]);
+}
+async function deletePfpImage(id) {
+  if (!isCustomPfp(id)) return;
+  if (!DB_URL || !DB_TOKEN) memoryPfps.delete(id);
+  else await db(["DEL", "pfpimg2:" + id]).catch(() => {});
+}
+
+// [width, height] read from the file itself, null if it isnt a png / jpeg
+function imageSize(b) {
+  if (b.length > 24 && b.subarray(0, 8).toString("hex") === "89504e470d0a1a0a" && b.toString("ascii", 12, 16) === "IHDR")
+    return [b.readUInt32BE(16), b.readUInt32BE(20)];
+  if (b.length > 4 && b[0] === 0xff && b[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 0xff) return null;
+      const m = b[i + 1];
+      if (m === 0xff) {
+        i++;
+        continue;
+      }
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return [b.readUInt16BE(i + 7), b.readUInt16BE(i + 5)];
+      i += 2 + b.readUInt16BE(i + 2);
+    }
+  }
+  return null;
+}
+
+// ------------------------------------------------------------ picture checker (OpenAI moderation)
+// needs OPENAI_API_KEY (Render > Environment). if the check cant run, the picture is refused.
+const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
+const BLOCKED_PICTURE = ["sexual", "violence/graphic", "self-harm", "self-harm/intent", "self-harm/instructions"];
+const MAX_SEXUAL_SCORE = 0.4; // stricter than the default flag. lower = stricter
+
+// returns null if the picture is ok, otherwise the reason its refused
+async function checkPicture(base64, mime) {
+  if (!OPENAI_KEY) return "custom pictures are off (owner hasnt set up the picture checker)";
+  try {
+    const r = await fetch("https://api.openai.com/v1/moderations", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + OPENAI_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "omni-moderation-latest", input: [{ type: "image_url", image_url: { url: "data:" + mime + ";base64," + base64 } }] }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!r.ok) throw new Error("checker said " + r.status);
+    const result = (await r.json()).results?.[0];
+    if (!result?.categories || typeof result.category_scores?.sexual !== "number") throw new Error("unexpected checker reply");
+    if (BLOCKED_PICTURE.some((k) => result.categories[k]) || result.category_scores.sexual >= MAX_SEXUAL_SCORE) return "that picture isnt allowed";
+    return null;
+  } catch (e) {
+    console.log("picture check failed:", e.message);
+    return "couldnt check the picture, try again later";
+  }
+}
+
+// ------------------------------------------------------------ gif / webp -> png (the game gets plain png)
+let sharp = null;
+try {
+  sharp = require("sharp");
+} catch {
+  console.log("WARNING: sharp isnt installed, gif + webp pictures are off");
+}
+
+// nothing is saved here: the png goes back to the player, then gets uploaded + checked like any picture
+async function onPfpConvert(body, ip) {
+  if (shuttingDown) return { ok: false, error: "Server Is Down. Be Back Soon!" };
+  if (tooMany("convip:" + ip, 20, 60000)) return { ok: false, error: "too many tries, wait a minute" };
+  const name = await checkToken(body.name, body.token);
+  if (!name) return { ok: false, error: "log in again" };
+  if (await isBanned(name)) return { ok: false, error: "ur banned" };
+  if (tooMany("conv:" + name.toLowerCase(), 6, 60000)) return { ok: false, error: "too many tries, wait a minute" };
+  if (!sharp) return { ok: false, error: "gif + webp arent set up on the server" };
+  const bytes = Buffer.from(String(body.data || ""), "base64");
+  if (bytes.length > MAX_ANIM_BYTES) return { ok: false, error: "too big, max is 5 MB" };
+  const isGif = /^GIF8[79]a/.test(bytes.toString("latin1", 0, 6));
+  const isWebp = bytes.toString("latin1", 0, 4) === "RIFF" && bytes.toString("latin1", 8, 12) === "WEBP";
+  if (!isGif && !isWebp) return { ok: false, error: "thats not a gif or webp" };
+  try {
+    const meta = await sharp(bytes, { limitInputPixels: 4000 * 4000 }).metadata();
+    if (meta.pages > 1) {
+      if (meta.pages > 500) return { ok: false, error: "too many frames, max is 500" };
+      const sheet = await makeSheet(bytes, meta);
+      if (!sheet) return { ok: false, error: "couldnt make that animation small enough" };
+      return { ok: true, data: sheet.png.toString("base64"), frames: sheet.frames, fps: sheet.fps };
+    }
+    // still picture: shrink until the png fits in 1 MB
+    for (const side of [750, 512, 384, 256]) {
+      const png = await sharp(bytes, { limitInputPixels: 4000 * 4000 })
+        .resize(side, side, { fit: "inside", withoutEnlargement: true })
+        .png()
+        .toBuffer();
+      if (png.length <= MAX_PFP_BYTES) return { ok: true, data: png.toString("base64") };
+    }
+    return { ok: false, error: "couldnt make that picture small enough" };
+  } catch (e) {
+    console.log("picture convert failed:", e.message);
+    return { ok: false, error: "couldnt open that picture (too large or broken)" };
+  }
+}
+
+async function onPfpUpload(body, ip) {
+  if (shuttingDown) return { ok: false, error: "Server Is Down. Be Back Soon!" };
+  if (tooMany("pfpip:" + ip, 20, 60000)) return { ok: false, error: "too many uploads, wait a minute" };
+  const name = await checkToken(body.name, body.token);
+  if (!name) return { ok: false, error: "log in again" };
+  if (await isBanned(name)) return { ok: false, error: "ur banned" };
+  if (tooMany("pfp:" + name.toLowerCase(), 6, 60000)) return { ok: false, error: "too many uploads, wait a minute" };
+  if (typeof body.data !== "string" || !body.data) return { ok: false, error: "no picture" };
+  const bytes = Buffer.from(body.data, "base64");
+  if (bytes.length > MAX_PFP_BYTES) return { ok: false, error: "too big, max is 1 MB" };
+  const size = imageSize(bytes);
+  if (!size || !size[0] || !size[1]) return { ok: false, error: "only png or jpg pictures" };
+  if (size[0] > MAX_PFP_SIDE || size[1] > MAX_PFP_SIDE) return { ok: false, error: "too big, max is 1500x1500" };
+
+  const frames = Number(body.frames) || 0;
+  let suffix = "";
+  if (frames > 1) {
+    const fps = Number(body.fps);
+    if (!Number.isInteger(frames) || frames > MAX_FRAMES || !Number.isInteger(fps) || fps < 1 || fps > 30) return { ok: false, error: "bad animation" };
+    const [w, h] = sheetSize(frames);
+    if (bytes[0] === 0xff || size[0] !== w || size[1] !== h) return { ok: false, error: "bad animation" };
+    suffix = "-a" + frames + "f" + fps;
+  }
+
+  const st = await getStats(name);
+  const old = st.pfp;
+  const data = bytes.toString("base64");
+  const sameKind = isCustomPfp(old) && old.slice(31) === suffix;
+  if (sameKind && (await getPfpImage(old)) === data) return { ok: true, pfp: old }; // same picture again
+  let refused;
+  try {
+    refused = suffix ? await checkSheet(bytes, frames) : await checkPicture(data, bytes[0] === 0xff ? "image/jpeg" : "image/png");
+  } catch (e) {
+    console.log("picture check failed:", e.message);
+    refused = "couldnt check the picture, try again later";
+  }
+  if (refused) return { ok: false, error: refused };
+  const id = "custom-" + crypto.randomBytes(12).toString("hex") + suffix;
+  if (!(await checkToken(body.name, body.token)) || (await isBanned(name))) return { ok: false, error: "log in again" };
+  await savePfpImage(id, data);
+  st.pfp = id;
+  await saveStats(name, st);
+  rememberPfp(name, st);
+  await deletePfpImage(old);
+  return { ok: true, pfp: id };
 }
 const NAME_COOLDOWN = 30 * 24 * 60 * 60 * 1000; // change ur name once a month
 
@@ -440,27 +658,31 @@ async function renameAccount(oldKey, newName) {
 }
 
 // global chat (everyone online)
-const globalChat = [];
-let globalLoaded = false;
-async function loadGlobalChat() {
-  if (globalLoaded) return;
-  globalLoaded = true;
+const CHAT_LANGS = ["en", "es", "ru"];
+const globalChats = { en: [], es: [], ru: [] };
+const globalLoaded = {};
+const chatLang = (lang) => (CHAT_LANGS.includes(lang) ? lang : "en"); // older mods dont say = english
+const chatKey = (lang) => (lang === "en" ? "gchat" : "gchat_" + lang);
+async function loadGlobalChat(lang) {
+  if (globalLoaded[lang]) return;
+  globalLoaded[lang] = true;
   if (!DB_URL || !DB_TOKEN) return;
   try {
-    const list = (await db(["LRANGE", "gchat", "0", "-1"])) || [];
+    const list = (await db(["LRANGE", chatKey(lang), "0", "-1"])) || [];
     for (const x of list) {
       try {
-        globalChat.push(JSON.parse(x));
+        globalChats[lang].push(JSON.parse(x));
       } catch {}
     }
   } catch {}
 }
-async function addGlobalChat(m) {
-  globalChat.push(m);
-  while (globalChat.length > 60) globalChat.shift();
+async function addGlobalChat(m, lang) {
+  const list = globalChats[lang];
+  list.push(m);
+  while (list.length > 60) list.shift();
   if (DB_URL && DB_TOKEN) {
-    await db(["RPUSH", "gchat", JSON.stringify(m)]).catch(() => {});
-    await db(["LTRIM", "gchat", "-60", "-1"]).catch(() => {});
+    await db(["RPUSH", chatKey(lang), JSON.stringify(m)]).catch(() => {});
+    await db(["LTRIM", chatKey(lang), "-60", "-1"]).catch(() => {});
   }
 }
 
@@ -1809,7 +2031,10 @@ async function handle(c, msg) {
       if (!allAccounts.has(key) && !(await getAccount(key))) return send(c, { t: "admin_done", msg: "no account called " + msg.name });
       for (const s of sessions.values()) if (s.name.toLowerCase() === key) kickSession(s, "ur account was deleted");
       const name = displayName(key);
+      const oldPfp = (await getStats(key)).pfp;
       await deleteAccount(key);
+      delete pfpCache[key];
+      await deletePfpImage(oldPfp);
       console.log(`owner deleted ${name}`);
       send(c, { t: "admin_done", msg: "deleted " + name });
       break;
@@ -1980,7 +2205,11 @@ async function handle(c, msg) {
     }
     case "profile_set": {
       const st = await getStats(c.name);
-      if (typeof msg.pfp === "string" && PFPS.includes(msg.pfp)) st.pfp = msg.pfp;
+      if (typeof msg.pfp === "string" && PFPS.includes(msg.pfp)) {
+        const old = st.pfp;
+        st.pfp = msg.pfp;
+        await deletePfpImage(old);
+      }
       if (typeof msg.noFR === "boolean") st.noFR = msg.noFR;
       if (typeof msg.noJoin === "boolean") st.noJoin = msg.noJoin;
       await saveStats(c.name, st);
@@ -2012,11 +2241,14 @@ async function handle(c, msg) {
       break;
     }
     // ---------- global chat
-    case "gchat_join":
-      await loadGlobalChat();
+    case "gchat_join": {
+      const lang = chatLang(msg.lang);
+      await loadGlobalChat(lang);
       c.inGlobal = true;
-      send(c, { t: "gchat_history", msgs: globalChat.slice(-40) });
+      c.chatLang = lang;
+      send(c, { t: "gchat_history", lang, msgs: globalChats[lang].slice(-40) });
       break;
+    }
     case "gchat_leave":
       c.inGlobal = false;
       break;
@@ -2030,18 +2262,22 @@ async function handle(c, msg) {
       if (gto) return send(c, { t: "friend_msg", msg: gto });
       if (Date.now() - (c.lastG || 0) < 2000) return send(c, { t: "friend_msg", msg: "slow down lol (2 sec)" });
       c.lastG = Date.now();
-      await loadGlobalChat();
+      const lang = chatLang(msg.lang);
+      await loadGlobalChat(lang);
       const st = await getStats(c.name);
       const m = { from: c.name, to: "", text: filterText(text), sticker, at: Date.now(), badge: badgeOf(c.name), owner: isOwnerName(c.name), pfp: pfpOf(st) };
-      await addGlobalChat(m);
-      for (const s of sessions.values()) if (s.inGlobal) send(s, { t: "gchat_msg", msg: m });
+      await addGlobalChat(m, lang);
+      for (const s of sessions.values()) if (s.inGlobal && s.chatLang === lang) send(s, { t: "gchat_msg", lang, msg: m });
       break;
     }
     case "admin_gchat_clear": {
       if (!isOwnerName(c.name)) return send(c, { t: "error", msg: "not allowed" });
-      globalChat.length = 0;
-      if (DB_URL && DB_TOKEN) await db(["DEL", "gchat"]).catch(() => {});
-      for (const s of sessions.values()) if (s.inGlobal) send(s, { t: "gchat_history", msgs: [] });
+      for (const lang of CHAT_LANGS) {
+        globalChats[lang].length = 0;
+        globalLoaded[lang] = true;
+        if (DB_URL && DB_TOKEN) await db(["DEL", chatKey(lang)]).catch(() => {});
+      }
+      for (const s of sessions.values()) if (s.inGlobal) send(s, { t: "gchat_history", lang: s.chatLang, msgs: [] });
       send(c, { t: "admin_done", msg: "global chat cleared" });
       break;
     }
@@ -2280,6 +2516,7 @@ const server = http.createServer((req, res) => {
   const isAuth = req.url.startsWith("/auth");
   if (req.method === "POST" && (isPoll || isAuth)) {
     let data = "";
+    req.setEncoding("utf8");
     req.on("data", (chunk) => {
       data += chunk;
       if (data.length > 65536) req.destroy(); // junk protection
@@ -2302,6 +2539,40 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
       res.end(JSON.stringify(result));
     });
+    return;
+  }
+
+  // ---------- custom profile pictures: upload yours, download anyones
+  if (req.method === "POST" && req.url.startsWith("/pfp")) {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+      // pictures: 1 MB as base64 + a bit. gif / webp waiting to be converted: 5 MB
+      if (data.length > (req.url.startsWith("/pfpconvert") ? 7100000 : 1500000)) req.destroy();
+    });
+    req.on("end", async () => {
+      const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
+      let result;
+      try {
+        const handler = req.url.startsWith("/pfpconvert") ? onPfpConvert : onPfpUpload;
+        result = await handler(JSON.parse(data || "{}") || {}, ip);
+      } catch (e) {
+        console.log("pfp upload failed:", e.message);
+        result = { ok: false, error: "server error, try again" };
+      }
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify(result));
+    });
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/pfp")) {
+    const id = new URL(req.url, "http://x").searchParams.get("id") || "";
+    getPfpImage(id)
+      .catch(() => null)
+      .then((data) => {
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify(data ? { ok: true, data } : { ok: false }));
+      });
     return;
   }
 
